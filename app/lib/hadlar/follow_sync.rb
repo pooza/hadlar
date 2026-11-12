@@ -191,8 +191,7 @@ module Hadlar
     # 取った後に受信のスレッド（`on_follow`）が足したフォロワーは、承認待ち（`requested`）にだけ入って外す側に回る —
     # 鍵の相手がフォローした直後に、返したばかりの申請を取り消していた。⚠ 止めている相手は、いまのフォロワーでも外す。
     def apply(to_follow, to_unfollow)
-      current = roster.ids || Set.new
-      to_unfollow = to_unfollow.reject {|id| current.include?(id.to_s) && !stopped?(id)}
+      to_unfollow = to_unfollow.reject {|id| roster.ids&.include?(id.to_s) && !stopped?(id)}
       unfollowed = to_unfollow.select {|id| attempt(:unfollow, id)}
       followed = to_follow.select {|id| attempt(:follow, id)}
       failed = (to_follow.size + to_unfollow.size) - (followed.size + unfollowed.size)
