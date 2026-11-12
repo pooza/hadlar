@@ -1,0 +1,171 @@
+module Hadlar
+  # 常駐プロセスに内蔵するスケジューラ。ハートビートと、枠に載せた投稿
+  # （`PostingJob`）を回す。
+  #
+  # ⚠⚠ **枠ごとにジョブを登録しない。**ライブは 8 時間で 240 枠あり、枠の数だけ
+  # 登録すると日をまたぐたびに登録し直すことになる（＝進行位置を状態として持つのと
+  # 同じ）。**一定間隔で叩き（tick）、そのつど「いま枠の頭か」を時刻から計算する。**
+  # ⚠ 落ちて戻ってきても位置がずれない（→ makoto2#10）。
+  #
+  # ⚠ **投稿の中身はここに書かない。**何を投稿するかはライブ（makoto2#13）・朝挨拶（makoto2#17）・
+  # 曲紹介（makoto2#16）がそれぞれ `PostingJob` を作って `register` する。
+  class Scheduler
+    include Singleton
+    include Package
+
+    attr_reader :scheduler
+
+    def exec
+      schedule_heartbeat
+      schedule_posts
+      @scheduler.join
+    end
+
+    def shutdown
+      @scheduler.shutdown(:kill)
+    end
+
+    # 投稿を登録する。⚠ `exec` の前に呼ぶこと。
+    #
+    # ⚠ hadlar は自分から出す投稿を持たない（v1 は話しかけられたら返すだけ）。makoto2 の実況の窓の検査
+    # （`CommentaryWindow`）は写していない。自分から投稿する機能を足すときに、窓が要るかを決め直す。
+    def register(job)
+      @jobs.push(job)
+      logger.info(scheduler: 'register', post: job.name, timetable: job.timetable.to_s)
+      return self
+    end
+
+    # 🔴 **起動時の検査で登録を見送った投稿**（makoto2#350 → `HadlarDaemon#register_jobs`）。
+    # ⚠ **痕跡に残して `/healthz` に言わせる**（→ `Health#errors`）。
+    #
+    # @param name [String] 投稿の名前（ライブは 4 本まとめて `live`）
+    # @param reason [String] 人が読む理由
+    def reject(name, reason)
+      @rejected[name.to_s] = reason
+      logger.error(scheduler: 'reject', post: name.to_s, reason: reason)
+      return self
+    end
+
+    # 見送った投稿と理由。⚠ **無ければ空。**
+    def rejected
+      return @rejected.dup
+    end
+
+    # 🔴 **見張る別スレッド**（makoto2#611）。`-> {name => Thread or nil}`。⚠ nil は起こしていない（切ってある）。
+    # ⚠ 常駐が渡す（→ `HadlarDaemon#start`）。
+    attr_writer :thread_watch
+
+    # 死んでいる別スレッドの名前。⚠ 見張りが無ければ nil（痕跡を書き直さない）。
+    def dead_threads
+      return nil unless @thread_watch
+      return @thread_watch.call.filter_map {|name, thread| name.to_s if thread && !thread.alive?}
+    end
+
+    def clear
+      @jobs.clear
+      @rejected.clear
+      @thread_watch = nil
+      return self
+    end
+
+    # 1 回ぶんの叩き。⚠⚠ **1 本の投稿が落ちても他を巻き込まない。**ライブ当日に
+    # 1 本の例外で残りの枠を全部落とすのが最悪の壊れ方（→ docs/CLAUDE.md）。
+    def tick(time = nil)
+      time ||= Time.now
+      results = @jobs.map do |job|
+        job.exec(time)
+      rescue => e
+        logger.error(scheduler: 'tick', post: job.name, error: e)
+        report_error(e, post: job.name)
+        next nil
+      end
+      record_tick
+      return results
+    end
+
+    private
+
+    # ⚠⚠ **tick が回ったこと自体を痕跡に残す**（makoto2#80 の黄 7）。⚠ **ハートビートは別の
+    # rufus ジョブ**なので、**tick 側だけが詰まっても `at` は更新され続ける** —
+    # 「生きているが投稿していない」の検知が、まさにその状態で効かなかった。
+    #
+    # ⚠ **投稿が 1 本も出なくても記録する。**ここで見たいのは**枠を見に行けているか**
+    # であって、投稿の成否は別の痕跡が持つ（→ `Heartbeat` 冒頭の表）。
+    # ⚠⚠ **書けなくても tick は止めない**（痕跡は観測のためのもの）。
+    def record_tick
+      dead = dead_threads
+      report_dead_threads(dead)
+      Heartbeat.record_tick(dead_threads: dead)
+    rescue => e
+      logger.error(scheduler: 'tick', error: e)
+      report_error(e)
+    end
+
+    # 🔴 **新しく死んだスレッドを見つけた 1 回だけ Sentry へ**（makoto2#639・Kuma の口より小さく済むほうを選んだ）。
+    # ⚠⚠ `hadlar status` にしか出ないと、返事が止まっても次の同期まで気づかない。⚠ 続いていることは status が言う。
+    def report_dead_threads(dead)
+      return unless dead
+      (dead - Heartbeat.dead_threads).each do |name|
+        report_error(RuntimeError.new("thread #{name} is dead"), scheduler: 'thread_watch')
+      end
+    rescue => e
+      logger.error(scheduler: 'thread_watch', error: e)
+    end
+
+    def initialize
+      @scheduler = Rufus::Scheduler.new
+      @jobs = []
+      @rejected = {}
+    end
+
+    def schedule_heartbeat
+      interval = config['/scheduler/heartbeat/interval']
+      @scheduler.every interval, first: :now do
+        # 🔴 **`version` / `jobs` は版を粗くしか区別しない**（makoto2#242）— ⚠⚠ **同じ `0.6.0` / `7` の
+        # まま何コミットでも進む**ので、**起動時に読み込んだ `revision` を並べる。**
+        logger.info(
+          scheduler: 'heartbeat', version: Package.version, revision: Package.revision, jobs: jobs,
+        )
+        # ⚠ **監視はログではなくこの痕跡を見る**（→ `Heartbeat` / `Health`）。
+        # 書けなくてもハートビートそのものは止めない（下の rescue の内側）。
+        Heartbeat.touch(jobs: jobs, job_names: job_names, rejected: rejected)
+      rescue => e
+        logger.error(scheduler: 'heartbeat', error: e)
+        report_error(e)
+      end
+    end
+
+    # 🔴 **登録が 1 つも無くても tick を回す**（hadlar）。⚠⚠ tick は別スレッドの見張り（makoto2#611）と
+    # 痕跡の `ticked_at` も兼ねるので、makoto2 のように「投稿が無ければ作らない」にすると、返事のスレッドが
+    # 死んでも誰も気づかない（hadlar は自分から出す投稿を持たない）。
+    def schedule_posts
+      # ⚠⚠ **登録を先に済ませる。**下の初回の tick は投稿を伴うので、HTTP の再送で
+      # 秒単位に伸びうる。⚠ **後に登録すると、伸びている間に次の枠が tolerance ごと
+      # 過ぎて落ちる**（ライブの枠は 2 分間隔）。
+      @scheduler.every config['/scheduler/tick'] do
+        tick
+      end
+      # ⚠⚠ **最初の 1 回はここで叩く。**`every` は最初の間隔を待つので、これが無いと
+      # 枠の頭 ＋ tolerance の内側で再起動したときに**その枠が落ちる**（→ makoto2#47）。
+      # ⚠ 位置の計算そのものは正しいのに、**再起動直後にそれを呼ぶ機会が無い**という
+      # 形で「落ちて戻ってきても位置がずれない」が効かなくなっていた。
+      # 🔴 **初回が伸びて `every` の 1 回目と重なっても、同じ枠は 1 回しか処理されない**
+      # （→ `PostingJob#claim`）。⚠⚠ **以前はここを冪等キーに任せていたが、実機の
+      # Mastodon は 2 通目を畳まず 500 を返した**（makoto2#109・2026-08-18 実測）。
+      # ⚠ **畳んでくれることを当てにしない。**
+      tick
+      return @jobs.size
+    end
+
+    # 登録された投稿の数。0 のままなら「常駐しているが何もしていない」状態が
+    # 検知できる。⚠ ハートビート自身や tick は数えない。
+    def jobs
+      return @jobs.size
+    end
+
+    # ⚠ **本数だけでは「morning が居る」を確かめられない**（makoto2#242・PR makoto2#238 の Codex の P2）。
+    def job_names
+      return @jobs.map(&:name)
+    end
+  end
+end

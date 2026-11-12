@@ -1,0 +1,42 @@
+# 正本は pooza/ginseng-style の config/rubocop.yml。ここには MAKOTO 固有の差分だけを書く。
+# ⚠ 共通に見える緩和をここに足さないこと。共通化したい場合は pooza/ginseng-style に Issue を立てる。
+# ⚠ `bundle exec rubocop` で実行すること（inherit_gem は gem のパス解決に Bundler を使う）。
+inherit_gem:
+  ginseng-style: config/rubocop.yml
+
+plugins:
+  - rubocop-sequel
+
+# ⚠⚠ inherit_mode が無いと、ここの Exclude / Include は継承した配列を
+# **置換**する（マージされない）。Include を書いた瞬間に対象が bin/hadlar だけに
+# なり、87 ファイル → 1 ファイルになる。
+# ⚠ Include は merge に入れない。merge にすると rubocop 既定の Include（Gemfile
+#   など）まで戻ってきて、他のリポジトリと対象がずれる。**全部書く。**
+inherit_mode:
+  merge:
+    - Exclude
+
+AllCops:
+  Exclude:
+    - seed/**/*
+    - var/**/*
+  Include:
+    # ⚠⚠ 継承分（ginseng-style の config/rubocop.yml の 5 つ）も含めて全部書く。
+    #   1 つでも落とすと、そのパターンのファイルが黙って lint 対象から外れる。
+    - '**/*.rb'
+    - '**/*.gemspec'
+    - '**/Gemfile'
+    - '**/Rakefile'
+    - '**/config.ru'
+    - bin/hadlar # ここから下が MAKOTO 固有
+  TargetRubyVersion: 3.4
+Sequel:
+  Exclude:
+    - '*'
+  Include:
+    - '**/model/**/*.rb'
+    - app/migration/**/*.rb
+Sequel/ConcurrentIndex:
+  Enabled: false
+Sequel/IrreversibleMigration:
+  Enabled: false

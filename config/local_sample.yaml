@@ -1,0 +1,25 @@
+# config/local.yaml の雛形。秘密情報を書く場所で、コミットしない（config/.gitignore）。
+# 実際の値はインフラノート（pooza/chubo2・private）側に置く。
+# CI はこの雛形をそのままコピーして使う（CI に秘密情報を持たせない）。
+environment: development
+mastodon:
+  # 開発・検証はデルムリン丼のステージング。本番は https://mstdn.delmulin.com
+  url: https://st3.mstdn.delmulin.com
+  acct: test
+  token: CHANGE_ME
+  # 🔴 **モロヘイヤを経由するか**（makoto2#124）。⚠ **既定は config/application.yaml の
+  # `true`（＝経由する）。**⚠⚠ **ここに `false` を書くと `X-Mulukhiya` が戻って
+  # Mastodon API 直になる** — **当日の切り戻しはこの 1 行。**
+  # mulukhiya: false
+# 監視の口（makoto2#84）。⚠ **既定は 127.0.0.1 なので、箱の外（Uptime Kuma）から叩くには
+# ここで開ける。**⚠⚠ **LAN 限定の読み取り専用の口**であり、管理コンソールではない。
+# ⚠ 開けるのは稼働ホストだけでよい（手元の開発では既定のまま）。
+# monitor:
+#   bind: 0.0.0.0
+
+# LLM の API キー（makoto2#18 のチャットボット・makoto2#19 の評価の道具）。⚠ **無ければチャットボットは応答しない**
+# （メンションの受信は続く）。⚠ 稼働ホストに置くのは、チャットボットを動かす箱だけ。
+# anthropic:
+#   api_key: CHANGE_ME
+#   # ⚠ キーがワークスペースに紐づいていないときだけ要る（Console の Workspaces に出る `wrkspc_…`）
+#   workspace_id: wrkspc_CHANGE_ME
