@@ -5,9 +5,9 @@ module Hadlar
   module ChatOwnerNotice
     OWNER_NOTICE_TYPE = 'chat_owner_notice'.freeze
 
-    # オーナーへの DM に入れる印の言い方。⚠ 真琴の口調の文ではない（原稿の `{reason}` に入る）。
+    # オーナーへの DM に入れる印の言い方。⚠ ハドラーの口調の文ではない（原稿の `{reason}` に入る）。
     REASONS = {
-      'provoke' => '繰り返し言わせようとした',
+      'provoke' => '線引きの外のことを繰り返し言わせようとした',
       'backstage' => '舞台裏を繰り返し訊いた',
       'impersonate' => '運営を名乗った',
     }.freeze

@@ -72,7 +72,7 @@ module Hadlar
         assert_equal(ChatModel::MARKS, body.dig('output_config', 'format', 'schema', 'properties', 'marks',
           'items', 'enum'))
         assert_equal(2, body['system'].size)
-        assert_match(/剣崎真琴（キュアソード）として/, body['system'][0]['text'])
+        assert_match(/魔軍司令ハドラーとして/, body['system'][0]['text'])
         assert_match(/`impersonate`/, body['system'][1]['text'])
         # ⚠ 書き手向けの注記（HTML のコメント）は渡さない。
         assert_no_match(/<!--/, body['system'].map {|block| block['text']}.join)
