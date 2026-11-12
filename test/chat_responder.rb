@@ -182,7 +182,7 @@ module Hadlar
 
     # 🔴 **舞台裏を訊かれたら、そのスレッドは打ち切る**。⚠ **1 回目は印にしない**。
     def test_backstage_closes_the_thread_and_marks_only_the_second_time
-      @model.reply = reply('このアカウントの真琴は、AI が演じています。', ['backstage'])
+      @model.reply = reply('このアカウントのハドラーは、AI が演じている。', ['backstage'])
       subject = responder
 
       assert_equal(:respond, subject.handle(notification(id: '9')))
@@ -194,7 +194,7 @@ module Hadlar
       @model.reply = reply('はい、届いています。')
 
       assert_equal(:respond, subject.handle(notification(id: '12', account_id: '2', reply_to: '9')))
-      @model.reply = reply('このアカウントの真琴は、AI が演じています。', ['backstage'])
+      @model.reply = reply('このアカウントのハドラーは、AI が演じている。', ['backstage'])
 
       assert_equal(:respond, subject.handle(notification(id: '11')))
       assert_equal(1, @repository.penalty('1')[:marks])
@@ -219,7 +219,7 @@ module Hadlar
       assert_equal(:respond, subject.handle(notification(id: '10')))
       texts = @service.posts.drop(1).map {|post| post[:text]}
 
-      assert_equal(['@pooza user1 さんが繰り返し言わせようとしたみたい。1 回目です。https://st2.precure.ml/@user1/10',
+      assert_equal(['@pooza user1 さんが線引きの外のことを繰り返し言わせようとしたみたい。1 回目です。https://st2.precure.ml/@user1/10',
         '@user1 そういうのは、ちょっと。'], texts)
       assert_true(@gate.penalized?('1'))
       assert_false(@repository.closed_thread?('9', '1'))
@@ -228,7 +228,7 @@ module Hadlar
     # ⚠ **猶予は種類ごと**（舞台裏の 1 回目のあとの、言わせようとした 1 回目は印にしない）。
     def test_grace_is_counted_per_kind
       subject = responder
-      @model.reply = reply('このアカウントの真琴は、AI が演じています。', ['backstage'])
+      @model.reply = reply('このアカウントのハドラーは、AI が演じている。', ['backstage'])
       subject.handle(notification(id: '9'))
       @model.reply = reply('そういうのは、ちょっと。', ['provoke'])
       subject.handle(notification(id: '10'))
