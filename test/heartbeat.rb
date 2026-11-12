@@ -1,0 +1,456 @@
+module Hadlar
+  class HeartbeatTest < TestCase
+    setup do
+      clear
+    end
+
+    teardown do
+      clear
+    end
+
+    # ⚠ 差し替え用の一時ファイルと鍵も片付ける（→ `Heartbeat#write` / `#with_lock`）。
+    def clear
+      FileUtils.rm_f(Heartbeat.path)
+      FileUtils.rm_f(Heartbeat.lock_path)
+      FileUtils.rm_f(Dir.glob("#{Heartbeat.path}.*.tmp"))
+    end
+
+    # ⚠ **今の時刻から取る**（落ちた記録は `failure_stale` で今と比べて古くなる・v1.0.2 のリリース前レビューの赤）。
+    # ⚠⚠ 固定した日付だと、その日から 7 日たつとテストが落ちた。
+    def now
+      @now ||= Time.at(Time.now.to_i).getlocal('+09:00')
+      return @now
+    end
+
+    # ⚠ **テストは稼働中の痕跡を書き換えない**（`Environment.db` と同じ理由）。
+    def test_path_is_separated_in_test
+      assert_equal(File.join(Environment.dir, 'tmp/run/heartbeat_test.json'), Heartbeat.path)
+    end
+
+    def test_touch_and_read
+      Heartbeat.touch(jobs: 3, now: now)
+      record = Heartbeat.read
+
+      assert_equal(3, record[:jobs])
+      assert_equal(Package.version, record[:version])
+      assert_equal(Package.revision, record[:revision])
+      assert_equal(Process.pid, record[:pid])
+      assert_equal(now.getutc.iso8601, record[:at])
+    end
+
+    def test_touch_keeps_the_revision_and_the_job_names
+      Heartbeat.touch(jobs: 2, job_names: ['morning', 'song'], now: now)
+
+      assert_equal(['morning', 'song'], Heartbeat.read[:job_names])
+      assert_equal(Package.revision, Heartbeat.read[:revision])
+    end
+
+    # ⚠ **`job_names` を渡さない `touch` は名前を消さない**（makoto2#354）。
+    def test_touch_without_job_names_keeps_them
+      Heartbeat.touch(jobs: 2, job_names: ['morning', 'song'], now: now)
+      Heartbeat.touch(jobs: 2, now: now)
+
+      assert_equal(['morning', 'song'], Heartbeat.read[:job_names])
+    end
+
+    # 🔴 **登録を見送った投稿を残す**（makoto2#350）。⚠ **無ければ空に戻す**（前の起動の値を居座らせない）。
+    def test_touch_records_and_clears_the_rejected_jobs
+      Heartbeat.touch(jobs: 6, rejected: {'song' => 'song: broken'}, now: now)
+
+      assert_equal({'song' => 'song: broken'}, Heartbeat.rejected)
+
+      Heartbeat.touch(jobs: 7, now: now)
+
+      assert_equal({}, Heartbeat.rejected)
+    end
+
+    def test_read_without_file
+      assert_nil(Heartbeat.read)
+      assert_nil(Heartbeat.jobs)
+      assert_nil(Heartbeat.age)
+    end
+
+    # ⚠⚠ **壊れていたら nil。**中身を信じて「健全」と誤答しない。
+    def test_read_broken_file
+      FileUtils.mkdir_p(File.dirname(Heartbeat.path))
+      File.write(Heartbeat.path, 'not json')
+
+      assert_nil(Heartbeat.read)
+      assert_true(Heartbeat.stale?)
+    end
+
+    # ⚠ 時刻の欠けた痕跡も読めないものとして扱う（経過が出せない）。
+    def test_read_file_without_time
+      FileUtils.mkdir_p(File.dirname(Heartbeat.path))
+      File.write(Heartbeat.path, {jobs: 1}.to_json)
+
+      assert_nil(Heartbeat.read)
+    end
+
+    def test_age
+      Heartbeat.touch(jobs: 1, now: now)
+
+      assert_equal(90, Heartbeat.age(now + 90).round)
+    end
+
+    # ⚠⚠ **閾値は設定から出す。**間隔を延ばした瞬間に監視が誤検知しないこと。
+    def test_limit_comes_from_config
+      config['/scheduler/heartbeat/interval'] = '10m'
+
+      assert_equal(600 * Heartbeat::STALE_FACTOR, Heartbeat.limit)
+    end
+
+    def test_stale
+      config['/scheduler/heartbeat/interval'] = '1m'
+      Heartbeat.touch(jobs: 1, now: now)
+
+      # ⚠ 1 回の取りこぼしでは騒がない。
+      assert_false(Heartbeat.stale?(now + 120))
+      assert_true(Heartbeat.stale?(now + 181))
+    end
+
+    # ⚠ **痕跡が無ければ「止まっている」。**
+    def test_stale_without_file
+      assert_true(Heartbeat.stale?(now))
+    end
+
+    def test_rejects_bad_interval
+      config['/scheduler/heartbeat/interval'] = 'soon'
+
+      assert_raise(Ginseng::ConfigError) {Heartbeat.limit}
+    end
+
+    # ⚠⚠ **ここから makoto2#78。**投稿の結末を数える。
+
+    def test_record_success_and_failure
+      Heartbeat.record_failure(now: now)
+      Heartbeat.record_failure(now: now + 60)
+
+      assert_equal(2, Heartbeat.failures)
+      assert_equal(now + 60, Heartbeat.failed_at)
+      assert_nil(Heartbeat.posted_at)
+
+      Heartbeat.record_success(now: now + 120)
+
+      assert_equal(0, Heartbeat.failures)
+      assert_equal(now + 120, Heartbeat.posted_at)
+    end
+
+    def test_failures_without_file
+      assert_equal(0, Heartbeat.failures)
+      assert_nil(Heartbeat.posted_at)
+      assert_nil(Heartbeat.failed_at)
+    end
+
+    # ⚠⚠ **ハートビートは 1 時間ごとに書き直される。**素に書き直すと**枠の結末が
+    # 毎時ぜんぶ消える。**
+    def test_touch_keeps_the_posting_record
+      Heartbeat.record_failure(now: now)
+      Heartbeat.touch(jobs: 5, now: now + 60)
+
+      assert_equal(1, Heartbeat.failures)
+      assert_equal(now, Heartbeat.failed_at)
+      assert_equal(5, Heartbeat.jobs)
+    end
+
+    # ⚠ **逆向きも。**枠の結末がハートビートの側を消さないこと。
+    def test_record_keeps_the_heartbeat
+      Heartbeat.touch(jobs: 5, now: now)
+      Heartbeat.record_success(now: now + 60)
+
+      assert_equal(5, Heartbeat.jobs)
+      assert_equal(now.getutc.iso8601, Heartbeat.read[:at])
+    end
+
+    # ⚠⚠ **時刻の欠けた痕跡でも、投稿の結末は引き継ぐ。**`read` は nil を返すが、
+    # 書き直す側は `stored` を見るため。
+    def test_update_keeps_the_record_without_time
+      FileUtils.mkdir_p(File.dirname(Heartbeat.path))
+      File.write(Heartbeat.path, {posts: {HeartbeatPosts::UNNAMED_POST => {failures: 2}}}.to_json)
+      Heartbeat.record_failure(now: now)
+
+      assert_nil(Heartbeat.read)
+      assert_equal(3, Heartbeat.failures)
+    end
+
+    # 🔴 **makoto2#86 の本体。**⚠⚠ **枠が違えば、成功しても他の枠の連敗は 0 に戻らない。**
+    # ⚠ **`0.5` は毎日必ず成功する枠を 3 つ増やす**ので、**まとめて戻すと閾値に
+    # 構造的に届かなくなる**（→ `Heartbeat` の「結末は枠ごとに持つ」）。
+    def test_a_success_does_not_clear_another_posts_failures
+      Heartbeat.record_failure(post: 'announcement', slot: 'announcement-1', now: now)
+      Heartbeat.record_success(post: 'morning', now: now + 60)
+      Heartbeat.record_failure(post: 'announcement', slot: 'announcement-2', now: now + 120)
+      Heartbeat.record_success(post: 'song', now: now + 180)
+
+      assert_equal(2, Heartbeat.failures)
+      assert_equal({'announcement' => 2}, Heartbeat.failing_posts(limit: 2))
+    end
+
+    # ⚠ **自分の枠の成功は、自分の連敗だけを 0 に戻す。**
+    def test_a_success_clears_its_own_posts_failures
+      Heartbeat.record_failure(post: 'announcement', slot: 'announcement-1', now: now)
+      Heartbeat.record_failure(post: 'announcement', slot: 'announcement-2', now: now + 60)
+      Heartbeat.record_success(post: 'announcement', now: now + 120)
+
+      assert_equal(0, Heartbeat.failures)
+      assert_equal({}, Heartbeat.failing_posts(limit: 1))
+    end
+
+    # 🔴 **合計にしない。**⚠⚠ **別々の枠が 1 回ずつ落ちたのと、1 つの枠が続けて
+    # 2 回落ちたのは意味が違う** — **閾値が見るのは後者。**
+    def test_failures_is_the_maximum_not_the_sum
+      Heartbeat.record_failure(post: 'announcement', slot: 'announcement-1', now: now)
+      Heartbeat.record_failure(post: 'song', slot: 'song-1', now: now + 60)
+
+      assert_equal(1, Heartbeat.failures)
+    end
+
+    # ⚠⚠ **同じ枠は 1 回しか数えない**（makoto2#81）。⚠ **時刻だけは進める**（最後に落ちた
+    # のがいつかは知りたい）。
+    def test_the_same_slot_is_counted_once
+      Heartbeat.record_failure(slot: 'live-1', now: now)
+      Heartbeat.record_failure(slot: 'live-1', now: now + 5)
+
+      assert_equal(1, Heartbeat.failures)
+      assert_equal(now + 5, Heartbeat.failed_at)
+
+      Heartbeat.record_failure(slot: 'live-2', now: now + 180)
+
+      assert_equal(2, Heartbeat.failures)
+    end
+
+    # ⚠ **1 本出れば覚えている枠も忘れる。**忘れないと、次に同じ枠が落ちても
+    # 数えられない（枠の識別子は日付を含むので実際には重ならないが、ここは対称に）。
+    def test_a_success_forgets_the_counted_slots
+      Heartbeat.record_failure(slot: 'live-1', now: now)
+      Heartbeat.record_success(now: now + 60)
+      Heartbeat.record_failure(slot: 'live-1', now: now + 120)
+
+      assert_equal(1, Heartbeat.failures)
+    end
+
+    # 🔴 **makoto2#86 が作った後退を塞ぐ**（Codex の P2・2 巡目）。⚠⚠ **枠ごとに分けた結果、
+    # 年に 1 日しか動かない枠（`live-eve` / `live-open` / `live-close`）の失敗が、
+    # その枠自身が次に成功するまで ＝ 翌年まで居座るようになった。**
+    # ⚠ **`/healthz/posting` が 1 年ずっと 503 になる。**
+    def test_a_stale_failure_stops_warning
+      config['/scheduler/posting/failure_stale'] = '7d'
+      3.times {|i| Heartbeat.record_failure(post: 'live-eve', slot: "live-eve-#{i}", now: now)}
+
+      assert_equal({'live-eve' => 3}, Heartbeat.failing_posts(limit: 3, now: now + 60))
+      assert_equal({}, Heartbeat.failing_posts(limit: 3, now: now + (8 * 24 * 60 * 60)))
+    end
+
+    # ⚠ **毎日出る枠は窓が効く前に翌日の成功で消える**ので、この寿命が効くのは
+    # **動かない枠だけ。**
+    def test_a_recent_failure_still_warns
+      config['/scheduler/posting/failure_stale'] = '7d'
+      3.times {|i| Heartbeat.record_failure(post: 'announcement', slot: "announcement-#{i}", now: now)}
+
+      assert_equal({'announcement' => 3}, Heartbeat.failing_posts(limit: 3, now: now + (6 * 24 * 60 * 60)))
+    end
+
+    # ⚠⚠ **設定を消せば元の「その枠が次に成功するまで永久」に戻る**（makoto2#77）。
+    def test_without_the_setting_a_failure_never_goes_stale
+      config.delete('/scheduler/posting/failure_stale')
+      3.times {|i| Heartbeat.record_failure(post: 'live-eve', slot: "live-eve-#{i}", now: now)}
+
+      assert_equal({'live-eve' => 3}, Heartbeat.failing_posts(limit: 3, now: now + (400 * 24 * 60 * 60)))
+    end
+
+    # 🔴 **値が壊れていたら例外。**⚠⚠ **黙って「期限なし」に落ちると、この塞ぎが
+    # 効いていないことに気付けない。**
+    def test_a_bad_failure_stale_raises
+      config['/scheduler/posting/failure_stale'] = 'いつか'
+      Heartbeat.record_failure(post: 'live-eve', slot: 'live-eve-1', now: now)
+
+      assert_raise(Ginseng::ConfigError) {Heartbeat.failing_posts(limit: 1, now: now)}
+    end
+
+    # ⚠⚠ **覚える枠の数は上限つき。**痕跡を無限に太らせない（ライブ当日は 160 枠）。
+    def test_counted_slots_are_bounded
+      (Heartbeat::COUNTED_SLOTS + 10).times {|i| Heartbeat.record_failure(slot: "live-#{i}", now: now)}
+
+      assert_equal(Heartbeat::COUNTED_SLOTS + 10, Heartbeat.failures)
+      slots = Heartbeat.stored[:posts][HeartbeatPosts::UNNAMED_POST.to_sym][:slots]
+
+      assert_equal(Heartbeat::COUNTED_SLOTS, slots.size)
+    end
+
+    # ⚠⚠ **書き込み中の痕跡を読ませない**（makoto2#81 のレビュー指摘）。`File.write` は
+    # **切り詰めてから書く**ので、⚠ **その隙に読んだ側は壊れた JSON を掴む。**
+    #
+    # 🔴 **これは「監視のせいで監視が誤報する」形。**読めない痕跡は `stale?` が true に
+    # なり、⚠⚠ **`hadlar status` が 1（復旧させる）を返して monit が正常な常駐を
+    # 再起動する。**⚠ **投稿ごとに書くようになって窓が広がった**（実測で 2,000 回中
+    # 625 回が nil だった）。
+    def test_read_never_sees_a_partial_write
+      Heartbeat.touch(jobs: 5, now: now)
+      results = []
+      reader = Thread.new {500.times {results.push(Heartbeat.read)}}
+      500.times {|i| Heartbeat.record_failure(slot: "live-#{i}", now: now)}
+      reader.join
+
+      assert_equal([], results.select(&:nil?))
+    end
+
+    # ⚠ 差し替えに使った一時ファイルを残さない。
+    def test_write_leaves_no_temporary_file
+      Heartbeat.touch(jobs: 5, now: now)
+
+      assert_equal([], Dir.glob("#{Heartbeat.path}.*.tmp"))
+    end
+
+    # ⚠⚠ **`Mutex` はプロセス内のスレッドしか守らない**（makoto2#81 のレビュー指摘）。
+    # ⚠ **常駐は再起動で一時的に 2 本になりうる** — `Health` が孤児で復旧を叩かせない
+    # のはまさにそれが起きるからで、**同じ前提をここでも置く。**
+    # ⚠ **実測では 600 のはずが 142 しか数えられなかった。**
+    def test_update_is_serialized_across_processes
+      rounds = 100
+      Heartbeat.touch(jobs: 5, now: now)
+      # ⚠ **書き込み可能な SQLite の接続を持ったまま fork しない**（sqlite3 が警告を
+      # 出す。⚠⚠ **子の中で閉じても遅い** — 警告は fork の時点で出る）。
+      # ⚠ **他のテストが開いたものも含めて手放す** — この試験は痕跡のファイルしか
+      # 触らない。Sequel は次に使うときに繋ぎ直す。
+      Sequel::DATABASES.each(&:disconnect)
+      pid = fork do
+        rounds.times {|i| Heartbeat.record_failure(slot: "child-#{i}", now: now)}
+        # ⚠ `exit!` にする。テストの teardown を子で走らせない。
+        exit!(0)
+      end
+      rounds.times {|i| Heartbeat.record_failure(slot: "parent-#{i}", now: now)}
+      Process.waitpid(pid)
+
+      assert_equal(rounds * 2, Heartbeat.failures)
+    end
+
+    def test_failing
+      config['/scheduler/posting/failure_limit'] = 3
+      2.times {Heartbeat.record_failure(now: now)}
+
+      assert_false(Heartbeat.failing?)
+
+      Heartbeat.record_failure(now: now)
+
+      assert_true(Heartbeat.failing?)
+    end
+
+    # ⚠⚠ **閾値は設定から出す**（`limit` と同じ理由）。⚠ **既定値に逃がさない** —
+    # 🔴 **猶予を張り直すのは、前回の起動から tick が 1 回でも完走したときだけ。**
+    # ⚠⚠ **無条件に書き換えると、起き上がるたびに猶予が再武装される** — ⚠ **systemd は
+    # `Restart=always` / `RestartSec=5`** なので、**初回 tick の途中で落ち続ける常駐が
+    # tick の観点で永遠に健全を返す**（リリース前レビューの黄 2）。
+    def test_a_crash_loop_does_not_rearm_the_grace
+      Heartbeat.record_tick(now: now - 7200)
+      12.times do |i|
+        Heartbeat.record_start(now: now + (i * 5))
+
+        assert_false(Heartbeat.tick_stale?(now + (i * 5)))
+      end
+
+      # ⚠ **猶予は最初の 1 回だけ**なので、そこから tick_limit を過ぎれば赤くなる。
+      assert_true(Heartbeat.tick_stale?(now + Heartbeat.tick_limit + 1))
+    end
+
+    # ⚠ **前回の稼働で tick が完走していれば、猶予は張り直す。**⚠⚠ **落ちて猶予より
+    # 長く空いてから戻る形**（古い `ticked_at` が残る）がこれ。
+    def test_a_healthy_restart_rearms_the_grace
+      Heartbeat.record_start(now: now - 3600)
+      Heartbeat.record_tick(now: now - 3000)
+      Heartbeat.record_start(now: now)
+
+      assert_false(Heartbeat.tick_stale?(now))
+      assert_true(Heartbeat.tick_stale?(now + Heartbeat.tick_limit + 1))
+    end
+
+    # ⚠ 痕跡がまったく無い初回起動でも猶予は付く（→ `Health` の回帰テスト）。
+    def test_the_first_start_gets_the_grace
+      Heartbeat.record_start(now: now)
+
+      assert_false(Heartbeat.tick_stale?(now))
+      assert_true(Heartbeat.tick_stale?(now + Heartbeat.tick_limit + 1))
+    end
+
+    # 🔴 **リハーサルが残した未来の `ticked_at` で、撤収後の tick の停止を見逃さない**（makoto2#421）。
+    # ⚠⚠ **見かけの 11/4 に書いた時刻が、実時間の再起動のあとも基準に残っていた。**
+    def test_a_start_drops_a_future_tick
+      real = now - (40 * 86_400)
+      Heartbeat.record_start(now: now - 3600)
+      Heartbeat.record_tick(now: now)
+      Heartbeat.record_start(now: real)
+
+      assert_nil(Heartbeat.ticked_at)
+      assert_false(Heartbeat.tick_stale?(real))
+      assert_true(Heartbeat.tick_stale?(real + Heartbeat.tick_limit + 1))
+    end
+
+    # 🔴 **リハーサル中の未来の `streamed_at` も捨てる**（makoto2#29・PR makoto2#586 の Codex の P2）。
+    def test_a_start_drops_a_future_stream
+      real = now - (40 * 86_400)
+      Heartbeat.record_start(now: now - 3600)
+      Heartbeat.record_stream(now: now)
+      Heartbeat.record_start(now: real)
+
+      assert_nil(Heartbeat.streamed_at)
+      assert_true(Heartbeat.stream_stale?(real + Heartbeat.stream_limit + 1))
+    end
+
+    # ⚠ **初回 tick の前に撤収した形**（未来の `started_at` だけが残る）でも猶予を据え置かない（makoto2#421）。
+    def test_a_start_drops_a_future_start
+      real = now - (40 * 86_400)
+      Heartbeat.record_start(now: now)
+      Heartbeat.record_start(now: real)
+
+      assert_equal(real.getutc.iso8601, Heartbeat.started_at.getutc.iso8601)
+      assert_true(Heartbeat.tick_stale?(real + Heartbeat.tick_limit + 1))
+    end
+
+    # 🔴 **リハーサルで落ちた枠を、撤収後も「失敗中」と言い続けない**（makoto2#421）。
+    # ⚠⚠ **未来の `failed_at` は `now - failed` が負なので `failure_stale` を超えず、
+    # 実時間で 6 週間ほど警告が残っていた。**
+    def test_a_start_drops_future_failures
+      config['/scheduler/posting/failure_stale'] = '7d'
+      real = now - (40 * 86_400)
+      Heartbeat.failure_limit.times do |i|
+        Heartbeat.record_failure(post: 'live', slot: "live-#{i}", now: now)
+      end
+      Heartbeat.record_failure(post: 'song', now: real - 60)
+
+      assert_true(Heartbeat.failing?(now: real))
+
+      Heartbeat.record_start(now: real)
+
+      assert_false(Heartbeat.failing?(now: real))
+      assert_equal(0, Heartbeat.posts[:live][:failures])
+      assert_nil(Heartbeat.posts[:live][:failed_at])
+      # ⚠ **過去の失敗は触らない。**
+      assert_equal(1, Heartbeat.posts[:song][:failures])
+      assert_equal((real - 60).getutc.iso8601, Heartbeat.failed_at.getutc.iso8601)
+    end
+
+    # 🔴 **撤収後の実時間の起き直しで、未来の `posted_at` も捨てる**（makoto2#441）。⚠⚠ **残すと
+    # `hadlar status` の "last success" が見かけの 11/4 を言い続ける**（年に 1 日の枠は翌年まで）。
+    # ⚠ **過去の成功は残し、全体の `posted_at` は残った枠の最新に引き直す。**
+    def test_a_start_drops_future_successes
+      real = now - (40 * 86_400)
+      Heartbeat.record_success(post: 'song', now: real - 60)
+      Heartbeat.record_success(post: 'live', now: now)
+      Heartbeat.record_start(now: real)
+
+      assert_nil(Heartbeat.posts[:live][:posted_at])
+      assert_equal((real - 60).getutc.iso8601, Heartbeat.posts[:song][:posted_at])
+      assert_equal((real - 60).getutc.iso8601, Heartbeat.posted_at.getutc.iso8601)
+    end
+
+    # 設定を消しただけで検知が静かに緩む形を作らない（makoto2#77 の裏返し）。
+    def test_rejects_bad_failure_limit
+      config['/scheduler/posting/failure_limit'] = 0
+
+      assert_raise(Ginseng::ConfigError) {Heartbeat.failure_limit}
+
+      config['/scheduler/posting/failure_limit'] = 'many'
+
+      assert_raise(Ginseng::ConfigError) {Heartbeat.failure_limit}
+    end
+  end
+end

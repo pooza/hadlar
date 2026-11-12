@@ -1,0 +1,144 @@
+module Hadlar
+  class Config < Ginseng::Config
+    include Package
+
+    # 設定が JSON Schema を通らない箇所。⚠ **通れば空。**
+    #
+    # ⚠ fail-open な rescue の内側でこの結果を読まないこと。読めなかった場合に
+    # 「異常なし」と読める。読み出しはここで行い、失敗は例外のまま上げる。
+    #
+    # ⚠⚠ **`errors` は呼ぶたびに schema 全体を回す**ので、60 秒間隔の監視から素で
+    # 呼ぶと、⚠ **そのぶん CPU を使い続ける**（`Health` はリクエストごとに作られる
+    # → `MonitorApp`）。**1 回だけ検証して覚える**（makoto2#99）。
+    #
+    # ⚠ **設定を書き換えたら `reload` で捨てる。**
+    def validation_errors
+      @validation_errors ||= errors.map {|message| sanitize_error(message)} + duration_errors
+      return @validation_errors
+    end
+
+    # 期間として読む設定（Fugit で秒に直す）。⚠ **新しく足したら、ここにも足す。**
+    DURATION_KEYS = [
+      '/chat/grace/window',
+      '/chat/catch_up/max_age',
+      '/chat/model/timeout',
+      '/chat/followers/refresh',
+      '/streaming/stale',
+      '/streaming/retry/base',
+      '/streaming/retry/max',
+      '/scheduler/tick',
+      '/scheduler/tolerance',
+      '/scheduler/heartbeat/interval',
+      '/scheduler/tick_stale',
+      '/scheduler/posting/failure_stale',
+    ].freeze
+
+    # 期間の配列（n 回目の印のペナルティの長さ）。
+    DURATION_LIST_KEYS = ['/chat/penalty'].freeze
+
+    # 🔴 **期間の書き損じを、使う瞬間ではなく検査で拾う**（makoto2#612）。⚠⚠ **schema は `type: string`
+    # しか見ない**ので、`30x` のような値は lint を通り、**本番で初めて `ConfigError` で黙る**
+    # （`deadline` / `timeout` は全員に黙る・`streaming/stale` は `hadlar status` が落ちる）。
+    # ⚠ **無いキーは見ない**（必須かどうかは schema の役目）。
+    #
+    # @param values [#key?, #[]] ⚠ テストが差し替える（平たいキーの Hash）
+    # @return [Array<String>]
+    def duration_errors(values = self)
+      found = DURATION_KEYS.filter_map do |key|
+        next unless values.key?(key)
+        "#{key}: '#{values[key]}' is not a positive duration" unless positive_duration?(values[key])
+      end
+      DURATION_LIST_KEYS.each do |key|
+        next unless values.key?(key)
+        list = values[key]
+        next found.push("#{key}: must be a non-empty list") unless list.is_a?(Array) && list.any?
+        list.each_with_index do |value, i|
+          next if positive_duration?(value)
+          found.push("#{key}[#{i}]: '#{value}' is not a positive duration")
+        end
+      end
+      return found
+    end
+
+    # ginseng-upstream: no — 捨てるのはこのアプリが足した `validation_errors` のメモ
+    def reload
+      @validation_errors = nil
+      return super
+    end
+
+    # 秘密情報を落とした設定のコピー。CLI の `hadlar config` が使う。
+    #
+    # 🔴 **落とす対象の正本は上流の合成**（`Ginseng::Masking#mask_fields` ＝
+    # **gem の既定 ＋ `/logger/mask_fields`**）。⚠⚠ **設定ファイル単独ではない**
+    # — 上流 `ginseng-core#586` で、設定は既定を**置き換える**のではなく
+    # **合成する**ものになった。⚠ **ここが `/logger/mask_fields` だけを見ていた
+    # あいだ、ログは 13 件落とすのに `hadlar config` は 7 件しか落とさなかった**
+    # （makoto2#216。`apikey` / `client_secret` / `refresh_token` が抜けていた）。
+    #
+    # 🔴 **`mask` ではなく `mask_fields` を呼ぶ。**⚠⚠ **`mask` は当たったキーを
+    # 落とす**ので、**「伏せたことを見せる」この出力には使えない** — 設定を点検する
+    # 人に**キーが在ること自体は見せる**のがこの口の役目で、消すと点検にならない
+    # （そのために上流が `mask_fields` を公開した → `ginseng-core#624` / v1.23.5）。
+    #
+    # ⚠ **戻り値は凍っている**（上流がメモ化した現物を返す）。**書き換えないこと。**
+    #
+    # ⚠⚠ **設定が読めなくても空にはならない** — 上流は既定 9 件へ倒す
+    # （`masking_list` の `rescue ConfigError`）。⚠ **そのとき落ちるのは `code`
+    # だけ**（上流が意図して既定から外しており、こちらの列挙が唯一の根拠 →
+    # makoto2#213）。🔴 **ログ側と同じ倒れ方なので、ここで別に読み直さない**（読み直すと
+    # マスク対象の列が 2 か所に分かれ、また必ずズレる）。
+    #
+    # ⚠ **大文字小文字で判定を変えない。**上流の `mask_field?` は
+    # `key.to_s.downcase` で見る（`Authorization` は HTTP ヘッダの綴りそのもの）。
+    # ⚠⚠ **ここだけ完全一致にすると、ログでは伏せるのに CLI では平文**になる。
+    #
+    # 🔴 **この口はキー名で伏せる。値の形は見ない**（makoto2#283）。⚠⚠ **ログ側の `mask_query_params` /
+    # `mask_url_paths` に当たるものが無い**ので、**URL の中に資格情報を埋めた設定キーを足すと
+    # 平文で出る。**⚠ **いまの `/mastodon/url` と `acct` が平文なのは承知の上**（資格情報は
+    # `token` だけで、ハンドルは公開のソースにも書いてある）。
+    def secure_dump
+      fields = logger.mask_fields
+      return each_with_object({}) do |(key, value), dest|
+        dest[key] = fields.intersect?(key.split('/').map(&:downcase)) ? '(masked)' : value
+      end
+    end
+
+    private
+
+    def positive_duration?(value)
+      return Fugit::Duration.parse(value.to_s)&.to_sec&.positive? || false
+    rescue ArgumentError
+      return false
+    end
+
+    # 🔴 **検査エラーは値そのものを本文に載せる** — ⚠ **json-schema がそうするのは
+    # `pattern` / `enum` / `const` の 3 つだけ**（`type` などは載せない）。
+    #
+    # ⚠⚠ **この文字列は外へ出る** — **`Health#config_warnings` を通って `/healthz` の 503 の
+    # 本文になり**、⚠ **起動時は `HadlarDaemon#validate_config` の `logger.error` にも載る。**
+    # 🔴 **ログのマスクでは落ちない** — ⚠⚠ **`mask_url_candidate?` が見るのはクエリと
+    # `user:pass` の形**なので、**`https://<鍵>@o1.ingest.sentry.io/456` のように鍵が
+    # userinfo のユーザ名側だけに埋まった DSN は、1 文字も伏せられない。**
+    #
+    # ⚠ **schema の URI も落とす**（読む側の役に立たないうえ長い）。
+    #
+    # ⚠⚠ **判定の正本は `secure_dump` と同じ `logger.mask_fields`**（**gem の既定 ＋
+    # `/logger/mask_fields`**）。🔴 **ここで列を書き起こさない** — **2 か所に分かれると必ずズレる。**
+    #
+    # 🔴 **値の側は欲張って読む**（Codex の P2）。⚠⚠ **最短一致にすると、値そのものが ` did not `
+    # を含むときにそこで止まり、残りが素で出る**（`value "x did not SECRET" did not match ...`）。
+    # ⚠ **欲張れば伏せすぎる側に倒れるだけで、秘密は残らない。**
+    def sanitize_error(message)
+      text = message.to_s.sub(/ in schema .*\z/, '')
+      return text unless masked_property?(text)
+      return text.sub(/(?<= value ).+(?= did not )/, '(masked)')
+    end
+
+    # ⚠ **`#/sentry/dsn` のような指し先を、`secure_dump` と同じ形で照合する。**
+    def masked_property?(text)
+      pointer = text[%r{\AThe property '#/([^']*)'}, 1]
+      return false unless pointer
+      return logger.mask_fields.intersect?(pointer.split('/').map(&:downcase))
+    end
+  end
+end

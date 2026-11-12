@@ -1,0 +1,482 @@
+module Hadlar
+  # ハドラーブロスの常駐プロセス。start / stop / restart / status は Ginseng::Daemon が持つ。
+  # プロセスは 1 本だけで、投稿のスケジュールはこの中の Scheduler が回す。
+  class HadlarDaemon < Ginseng::Daemon
+    include Package
+    include ProcessIdentity
+
+    # @param proc_dir [String] プロセスの一覧を読む場所。⚠ **テストが差し替える**
+    # ginseng-upstream: no — 身元の判定（→ `alive_state_of`）をテストで差し替える口
+    def initialize(opts = {})
+      super
+      @proc_dir = opts[:proc_dir] || ProcessIdentity::PROC_DIR
+    end
+
+    # 上流が読んだ番号 `found` が指すプロセスの状態。⚠ **上流の `:alive` / `:dead` /
+    # `:unknown` に「身元」を足す**（makoto2#80 の黄 6）。
+    #
+    # 🔴 **番号だけでは足りない。**⚠⚠ **`Process.alive_state` は「その番号が在るか」
+    # しか見ない**ので、⚠ **pid が再利用されると無関係なプロセスを常駐だと答える**
+    # （実測 — `sleep 300` の pid を pid ファイルに書くと `running (PID 354866)`）。
+    #
+    # ⚠⚠ **倒れ方が静かなのが問題だった** — `run_start` が「already running」で
+    # 終了し、⚠ **systemd の `Restart=always` が 5 秒ごとに叩き直す**ので、
+    # 🔴 **ボットは一度も起動せず、理由もログに残らない**（warn は stderr →
+    # `bin/hadlar_daemon.rb` が `/dev/null` に落とす）。
+    #
+    # ## 🔴 上書きするのは `alive_state` ではなく `alive_state_of`（makoto2#200・2026-09-20）
+    #
+    # ⚠⚠ **`alive_state` を上書きして `super` のあとに `pid` を読み直す形をやめた**
+    # （上流 [`ginseng-core#638`](https://github.com/pooza/ginseng-core/pull/638) が
+    # **「読んだ番号を受け取る上書き点」**を足したので移した・v1.24.0）。
+    #
+    # 🔴 **前の形は pid ファイルを 2 回読んでいた** — ⚠ **1 回目は `super` の中、
+    # 2 回目は身元を確かめるため**で、⚠⚠ **2 回の間に書き換わると「A の生死」に
+    # 「B の身元」を掛けた答え**になった（makoto2#200）。**ここで番号を受け取れば読み直さない。**
+    #
+    # ⚠ **`found` は nil にならない** — 🔴 **番号が取れなかったときの答えは上流の
+    # `alive_state` が決める**（**在るのに読めないなら `:unknown`・無いなら `:dead`**）。
+    # ⚠⚠ **したがって makoto2#257 で自分の箱に置いた `pid_file_unreadable?` の分岐は要らない**
+    # （**上流と同じ分け方が上流の側に入った**）。⚠ **ここで pid ファイルを読み直さないこと。**
+    #
+    # ## ⚠ 上書き点を選ぶ理由（`alive?` ではない・makoto2#101 / 2026-08-24）
+    #
+    # ⚠⚠ **上流が起動と停止の判断に使うのは `alive_state` のほう**（`abort_if_running!` /
+    # `run_restart` / `run_status`）で、⚠ **`alive?` は「真偽 2 値のまま残した既存の
+    # 呼び出し側のため」の薄い述語**にすぎない。**あちらを上書きしても `run_start` は
+    # 守れない。**🔴 **`alive_state_of` はその `alive_state` が通る唯一の点。**
+    #
+    # ⚠ **`:unknown`（`EPERM` ＝ 居るが触れない）はそのまま返す** — 🔴 **上流は
+    # `:unknown` でも起動しない**（触れないだけで生きている可能性がある）。
+    # ⚠⚠ **makoto2#111 で「`EPERM` は生きている」と自分の箱で塞いだ判断は、
+    # `:unknown` という 3 つ目の答えとして上流に入った。**
+    # ## ⚠ 上流の `process_pattern` へは寄せない（makoto2#605・ginseng-core 7.0.0 で確認）
+    #
+    # 上流は `ps` のコマンド行を正規表現 1 本で照合する。こちらはインタプリタ越しの起動（`ruby … hadlar_daemon.rb`）・
+    # 一時的なサブコマンド（`stop` / `status`）を argv を解いて見分け、`/proc` を差し替えるテストで縛っている
+    # （→ `ProcessIdentity`）。⚠ 上流の「確かめられないときは送らずに exit 1」（ginseng-core#756）は、ここが例外を上げたときに効く。
+    # ginseng-upstream: no — argv の解釈と `/proc` の差し替えはこのアプリのテストの都合
+    def alive_state_of(found)
+      state = super
+      return state unless state == :alive
+      return daemon_pid?(found, proc_dir: @proc_dir) ? :alive : :dead
+    end
+
+    def command
+      return nil
+    end
+
+    def motd
+      return [
+        "#{Package.full_name} (#{Environment.type})",
+        ('Ruby YJIT: Ready' if Environment.jit?),
+      ].compact.join("\n")
+    end
+
+    # ginseng-upstream: no — 常駐は `command` のプロセスを起こさず、同じプロセスでスケジューラ・監視・SSE を回す（`stop` も同じ）
+    def start(args = [])
+      # ⚠ **`revision` はここで固定される**（makoto2#242 → `Package.revision`）。
+      logger.info(daemon: app_name, version: Package.version, revision: Package.revision,
+        message: 'start')
+      # 🔴 **Sentry の `release` にリビジョンまで載せる**（makoto2#347）。
+      tag_sentry_release
+      # 🔴 **設定を起動時に 1 回検証する**（makoto2#99）。⚠ **止めない**（→ `validate_config`）。
+      validate_config
+      # ⚠ 登録より先に繋ぐ。原稿を引く口（`MessageSelector`）が接続を要る。
+      connect_db
+      register_jobs
+      # ⚠ 監視の口は登録のあとに開ける（makoto2#84）。⚠⚠ **先に開けると、まだ 0 本の
+      # `jobs` を見た `/healthz` が「投稿を 1 本も持たない」と赤くする。**
+      #
+      # 🔴 **起き上がったことを、口を開ける前に記録する**（PR makoto2#98 の Codex 指摘）。
+      # ⚠⚠ **初回の tick は枠を全部回し終えるまで痕跡を書かない**ので、これが無いと
+      # ⚠ **口を開けた直後から「tick が止まっている」と赤くなる**
+      # （→ `Heartbeat.record_start`）。
+      record_start
+      monitor_server.start
+      # 🔴 **トークンが生きているかを起き上がりで 1 回見る**（makoto2#106）。
+      # ⚠ **投稿はしないので副作用は無い。**
+      verify_credentials
+      # 🔴 **投稿先の本文の上限を、設定と突き合わせる**（makoto2#351）。
+      verify_max_length
+      # 🔴 **メンションの受信は別スレッド**（makoto2#29）。⚠⚠ **`Scheduler#exec` は戻らない**ので、その前に。
+      # ⚠ **繋がらなくても常駐は止めない**（→ `MentionListener`）。
+      # 🔴 **返事は受信とは別のスレッド**（makoto2#18 → `ChatResponder`）。⚠ キーが無い・切ってあるなら起こさない。
+      # 🔴 **フォローの突き合わせも別スレッド**（makoto2#606）。⚠ 切ってある・受信を切ってあるなら起こさない。
+      start_threads
+      Scheduler.instance.exec
+    rescue => e
+      logger.error(daemon: app_name, error: e)
+      # ⚠ **起き上がれなかったことを Sentry へ**（makoto2#28）。⚠⚠ **stderr は `/dev/null` で、
+      # `systemd` は 5 秒ごとに叩き直すだけ**なので、ログを見に行かない限り気づけない。
+      report_error(e, daemon: app_name)
+      raise
+    end
+
+    # ⚠ `run_start` の trap から同じインスタンスの `stop` が呼ばれる（→ Ginseng::Daemon）
+    # ので、⚠⚠ **常駐が畳まれるときに監視の口も一緒に閉じる。**
+    # ginseng-upstream: no — `start` と同じ（同じプロセスで回しているものを止める）
+    def stop
+      logger.info(daemon: app_name, version: Package.version, message: 'stop')
+      # 🔴 **畳む前に見張りを外す**（v1.0.2 のリリース前レビュー）。⚠⚠ 外さないと、止めたスレッドを
+      # 次の tick が「死んだ」と見て、再起動のたびに Sentry へ誤報する（makoto2#639）。
+      Scheduler.instance.thread_watch = nil
+      monitor_server.stop
+      # ⚠ **受信のスレッドも畳む**（makoto2#29・孤児を残さない）。
+      mention_listener.stop
+      follow_sync.stop
+      chat_responder&.stop
+      Scheduler.instance.shutdown
+    end
+
+    # 🔴 **別スレッドの生死を tick が見て痕跡に書く**（makoto2#611 → `hadlar status`）。⚠ 起こしていないものは見ない。
+    def start_threads
+      chat_responder&.start
+      follow_sync.start
+      # 🔴 **繋がったら取りこぼしに追いつく**（makoto2#610）。⚠ 返事をしないなら追いつかない。
+      mention_listener.catch_up = chat_responder && MentionCatchUp.new(handler: chat_responder)
+      mention_listener.start
+      # ⚠ 名前はスレッド自身の名前（`hadlar-chat` / `hadlar-follow` / `hadlar-stream`）。
+      workers = [chat_responder, follow_sync, mention_listener]
+      Scheduler.instance.thread_watch = -> {workers.filter_map {|w| w&.thread}.index_by(&:name)}
+    end
+
+    def monitor_server
+      @monitor_server ||= MonitorServer.new
+      return @monitor_server
+    end
+
+    def mention_listener
+      @mention_listener ||= MentionListener.new(handler: chat_responder, follower: follow_sync)
+      return @mention_listener
+    end
+
+    # ⚠ **切ってあってもフォローの通知は受ける**（一覧に足す・makoto2#510）。スレッドは `start` が起こさない（makoto2#606）。
+    def follow_sync
+      @follow_sync ||= FollowSync.new
+      return @follow_sync
+    end
+
+    # ⚠ **返事をしないなら nil**（受信はログに出すだけ・makoto2#29 の形）。
+    def chat_responder
+      return nil unless ChatResponder.enabled?
+      @chat_responder ||= ChatResponder.new
+      return @chat_responder
+    end
+
+    # 常駐が回す投稿を並べる。
+    #
+    # ⚠ **投稿の中身はここに書かない。**何を投稿するかは各機能が自分の `PostingJob`
+    # を作って持つ（→ `Scheduler`）。ここは並べるだけ。
+    # ⚠ **`Scheduler#exec` より前に呼ぶこと**（登録が 0 本だと tick そのものが作られない）。
+    #
+    # ## 🔴 検査に通らない投稿は見送り、常駐は上げる（makoto2#350）
+    #
+    # ⚠⚠ **以前は 1 本の検査が落ちると起動ごと拒んでいた** — **`monitor_server.start` に
+    # 届かないので `/healthz` は赤ではなく接続拒否**、**`systemd` が 5 秒ごとに叩き直して
+    # 同じところで落ち続ける。**🔴 **同じ故障が、稼働中なら 1 枠の劣化（makoto2#274）なのに、
+    # 起動時なら 7 枠全滅**という非対称だった。⚠ **`validate_config` はもともとこちらに
+    # 倒してある。**
+    #
+    # ⚠ **見送った投稿は痕跡に残し、`/healthz` が名前と理由を言う**（→ `Health#rejected_errors`）。
+    # ⚠⚠ **検査そのものは緩めていない** — **`rake config:lint` はこれまでどおり落ちる。**
+    def register_jobs
+      built, rejected = build_jobs
+      rejected.each {|name, error| reject_job(name, error)}
+      built.each do |job|
+        Scheduler.instance.register(job)
+      rescue => e
+        reject_job(job.name, e)
+      end
+      return Scheduler.instance
+    end
+
+    # 常駐が回す投稿の一覧（登録はしない）。⚠ **1 本でも検査に通らなければ例外。**
+    #
+    # 🔴 **作るだけで各機能の起動時の検査が走る**（`Song#validate` など）。⚠⚠ **`rake config:lint`
+    # が同じものを 1 回作る**（makoto2#276）— **スキーマで書けない相互条件**（「この type が
+    # `/message/anniversary` に登録されているか」）**は、ここを通さないと常駐の起動で
+    # 初めて分かる**ので、**デプロイの前に拾う。**
+    def jobs
+      built, rejected = build_jobs
+      raise rejected.values.first if rejected.any?
+      return built
+    end
+
+    # 投稿を作り、作れなかったものを分けて返す（makoto2#350）。⚠ **例外を上げない。**
+    #
+    # 🔴 **1 本の検査で他を巻き込まない**（→ `register_jobs`）。⚠ **ライブは 4 本を 1 つの
+    # 検査で作る**ので、**見送るときも `live` の名前で 4 本まとめて。**
+    #
+    # @return [Array(Array<PostingJob>, Hash{String => Exception})]
+    def build_jobs
+      built = []
+      rejected = {}
+      job_sources.each do |name, source|
+        built.concat(Array(source.call))
+      rescue => e
+        rejected[name] = e
+      end
+      return built, rejected
+    end
+
+    # 見送りの理由を人が読む 1 行にする。⚠ **`ConfigError` は文が既に投稿の名前で
+    # 始まる**ので重ねない。⚠⚠ **それ以外はクラス名を添える**（`EISDIR` か `EACCES` かが
+    # 文だけでは残らない・→ `SongSource#spoken?`）。
+    #
+    # 🔴 **ログと同じマスクを通す**（makoto2#423）。⚠⚠ **この 1 行は痕跡を経て `/healthz` の本文に
+    # 出る** — **syslog（`Logger`）と Sentry（`SentryScrubber`）は伏せるのに、ここだけが
+    # 素の文字列を出す口だった。**⚠ **正本は `/logger/mask_fields` など上流の合成**なので、
+    # 同等品を書かずに `logger.mask` を呼ぶ。
+    def describe_rejection(error)
+      message = error_message(error)
+      message = "#{error.class}: #{message}" unless error.is_a?(Ginseng::ConfigError)
+      return logger.mask(message)
+    end
+
+    # `config:lint` の 1 行。⚠ **投稿の名前で始まらない文には名前を付ける**（makoto2#561）。
+    # ⚠⚠ **強い窓そのものが壊れていると、全部の投稿が `commentary: <窓>: ...` の同じ文で落ち、
+    # どの投稿の行かが読めなかった。**⚠ 名前で始まる文（`song: ...`・`scheduler: song ...`）に
+    # もう一度付けると二重になる。
+    def lint_rejection(name, error)
+      message = describe_rejection(error)
+      return message if message.start_with?("#{name}:", "scheduler: #{name} ")
+      return "#{name}: #{message}"
+    end
+
+    private
+
+    # ⚠ hadlar は自分から出す投稿を持たない（v1 は話しかけられたら返すだけ）。makoto2 の予告・朝挨拶・曲紹介・
+    # ライブは写していない。⚠ 枠の仕組み（`Scheduler` の tick）は、別スレッドの見張りのために残してある。
+    def job_sources
+      return {}
+    end
+
+    # ⚠ **起き上がれなかったときと同じく Sentry へ**（makoto2#28）— **`/healthz` を見に行かない
+    # 限り、1 本減ったことに気づけない。**
+    def reject_job(name, error)
+      logger.error(daemon: app_name, post: name, error_class: error.class.name, error: error)
+      report_error(error, daemon: app_name, post: name)
+      Scheduler.instance.reject(name, describe_rejection(error))
+    end
+
+    # 🔴 **確かめた pid にだけ送る**（makoto2#162 / makoto2#169 / Codex の P1）。
+    #
+    # ⚠⚠ **`TERM` を送ってから pid ファイルを消す・`EPERM` では消さない**という
+    # makoto2#111 の 2 点は、✅ **上流（`pooza/ginseng-core#509` / `ginseng-core#532`）に入った**ので
+    # **`run_stop` ごと上流に任せる**（⚠ **消すのは「中身がまだその pid のときだけ」**
+    # という後継との競り合いの手当ても向こうにある）。⚠ **こちらに残るのは
+    # 身元の判定だけ** — **上流は pid ファイルの番号をそのまま信じて送る。**
+    #
+    # 🔴 **判定は「送る 1 点」に置く。**⚠⚠ **`run_stop` を上書きして手前で確かめる形
+    # にすると、確かめた pid と実際に送る pid が別物になりうる** — ⚠ **上流の
+    # `run_stop` は pid ファイルを読み直す**ので、**確かめてから送るまでの間に
+    # 後継が新しい pid を書けば、身元を確かめていない相手へ `TERM` が飛ぶ。**
+    # ⚠⚠ **まさに `remove_pid(expected)`（上流 `ginseng-core#532`）が相手にしている競り合い。**
+    # ginseng-upstream: no — `alive_state_of` と同じ（身元の判定をこのアプリで持つ）
+    def send_signal(signal, target)
+      return nil unless stoppable?(target)
+      return super
+    end
+
+    # 🔴 **その pid へ `TERM` を送ってよいか**（makoto2#162 / makoto2#169）。
+    #
+    # ⚠⚠ **`alive_state` には makoto2#80 の黄 6（pid の再利用）と黄 3（`0`）を塞いだが、
+    # `run_stop` はそこを通らない** — ⚠ **`run_restart` は `run_stop unless
+    # alive_state == :dead` なので身元を見た結果で呼ばれるが、`bin/hadlar_daemon.rb
+    # stop` を直に叩く経路は素通しだった。**
+    #
+    # 🔴 **`0` の枝は上流が引き取った**（makoto2#257・上流 `ginseng-core#627`）。⚠⚠ **`1.23.5`
+    # までの `pid` は `File.read(pid_file).to_i` だったので、空も壊れた文字列も `0` に
+    # なり、`0` は truthy なので `run_stop` 冒頭の `unless` を抜けて
+    # `Process.kill('TERM', 0)` ＝ 呼び出し元のプロセスグループ全体に TERM を送っていた。**
+    #
+    # ⚠ **`1.23.6` 以降は `parse_pid` が `''` / `"\n"` / `'abc'` / `'0'` / `'12_34'` /
+    # `pid_t` を超える数を全部 `nil` に倒す**ので、🔴 **`run_stop` は
+    # `send_signal` まで来ずに `abort_stop!` で止まる**（⚠⚠ **pid ファイルは残る** —
+    # **次の `run_start` が `write_pid` で原子的に奪う**ので詰まらない）。
+    #
+    # 🔴 **ここに残る仕事は「番号は妥当だが常駐ではない」だけ**（＝ pid の再利用）。
+    # ⚠ **`daemon_pid?` の `pid&.positive?` は残す** — **上流の保証に寄りかかる形を
+    # 1 枚だけ自分でも持っておく**（→ makoto2#198 / makoto2#199 で踏んだ「外した先が同じ挙動か」）。
+    #
+    # 🔴 **確かめられなかったときも送らない**（Codex の P1・makoto2#169）。⚠⚠ **`daemon_pid?`
+    # は「確かめられない」を `true` に倒す** — ⚠ **それは `alive?` にとっては正しい**
+    # （二重起動を避けるほうが重い）が、🔴 **止める側は破壊的なので、確かめられないなら
+    # 何もしないほうが安全。**⚠ **そのときは pid ファイルを残す**（`EPERM` の枝と同じ。
+    # ⚠⚠ **消した瞬間に孤児が確定する**）。
+    def stoppable?(target)
+      unless identifiable?(target)
+        warn "#{app_name} (PID #{target}) could not be identified. PID file kept."
+        exit 1
+      end
+      return true if daemon_pid?(target, proc_dir: @proc_dir)
+      # ⚠ **確かめて別物だったなら掃除してよい**（`ESRCH` の枝と同じ扱い）。⚠⚠ **残すと
+      # `run_start` が「already running」で無言終了する**（makoto2#80 の黄 6 で踏んだ形）。
+      #
+      # 🔴 **ただし「まだその番号のときだけ」消す**（makoto2#199）。⚠⚠ **`expected` を渡さない
+      # と後継が書いた pid ファイルまで消す** — ⚠ **後継は生きたままどの pid ファイル
+      # からも辿れなくなり、孤児が確定する**（🔴 **次の `run_start` は
+      # `abort_if_running!` を素通りするので 2 本目が立つ**）。⚠ **`send_signal` の
+      # コメントが挙げている競り合いは、まさにこの引数が相手にしているもの。**
+      remove_pid(target)
+      warn "PID file found, but PID #{target} is not #{app_name}."
+      return false
+    end
+
+    # 身元を**確かめられたか**（makoto2#169）。⚠⚠ **「確かめて別物だった」とは区別する** —
+    # **`daemon_pid?` は両方を混ぜて `true` / `false` に畳んでしまう。**
+    #
+    # | | `identifiable?` | `daemon_pid?` | `run_stop` |
+    # | --- | --- | --- | --- |
+    # | `/proc` が無い | **false** | true | 🔴 **送らない・pid ファイルは残す** |
+    # | `/proc/{pid}` が読めない（`EACCES`） | **false** | true | 🔴 **送らない・pid ファイルは残す** |
+    # | `/proc/{pid}` の stat が拒まれる | **false** | true | 🔴 **送らない・pid ファイルは残す** |
+    # | `/proc/{pid}` が無い（もう居ない） | true | true | 送る → `ESRCH` → 掃除 |
+    # | argv が読めて別物 | true | **false** | 送らない・掃除 |
+    # | argv が読めて常駐 | true | true | ✅ **送る** |
+    #
+    # ⚠ **「もう居ない」を false にしない。**⚠⚠ **そこを送らずに pid ファイルを残すと、
+    # `run_start` が「already running」で無言終了する**（makoto2#80 の黄 6 で踏んだ形）。
+    # 🔴 **確かめられなかったのではなく、確かめて「居ない」と分かった状態。**
+    def identifiable?(target)
+      return false unless File.directory?(@proc_dir)
+      entry = File.join(@proc_dir, target.to_s)
+      return true unless proc_entry?(entry)
+      argv(entry)
+      return true
+    rescue SystemCallError
+      return false
+    end
+
+    # `/proc/{pid}` が**在るか**（makoto2#169・Codex の 2 巡目）。
+    #
+    # 🔴 **`File.directory?` を使わない。**⚠⚠ **あれは「無い」も「stat を拒まれた」も
+    # 同じ false に畳む** — ⚠ **拒まれたほうが「もう居ない」に化け、`identifiable?`
+    # が true を返して `TERM` が飛ぶ**（＝ この PR が畳もうとしている形が、
+    # 1 段下に残っていた）。
+    #
+    # ⚠ **`ENOENT` だけを「確かめて、居ないと分かった」に倒し**、⚠⚠ **それ以外の
+    # `SystemCallError` は呼び元の `rescue` へ抜けさせる**（＝ 確かめられなかった）。
+    def proc_entry?(entry)
+      return File.stat(entry).directory?
+    rescue Errno::ENOENT
+      return false
+    end
+
+    # 設定を起動時に 1 回検証する（makoto2#99）。
+    #
+    # ⚠⚠ **`rake config:lint` は開発機で流すもの**で、⚠ **稼働ホストにしか無い
+    # `config/local.yaml` は検証を一度も通っていなかった。**
+    #
+    # 🔴 **通らなくても常駐は止めない**（2026-08-21・オーナー判断）。⚠⚠ **止めると
+    # systemd の `Restart=always` が 5 秒ごとに叩き直す形**になり、⚠ **11/4 当日に
+    # 踏むと復旧の時間が要る。**⚠⚠ **代わりに `/healthz` を赤にする**（→ `Health`）。
+    #
+    # ⚠ **ここで例外にしない**のは `record_start` と同じ扱い（痕跡が書けないことで
+    # 常駐が上がらないのを避ける）。
+    def validate_config
+      found = config.validation_errors
+      return found if found.empty?
+      logger.error(daemon: app_name, config: 'invalid', count: found.size, errors: found)
+      return found
+    rescue => e
+      # ⚠⚠ **検証そのものが落ちても常駐は上げる。**⚠ schema が読めないだけで
+      # ボットが動かなくなるほうが痛い。
+      logger.error(daemon: app_name, config: 'unverified', error: e)
+      return []
+    end
+
+    # トークンの失効を起き上がりで見に行く（makoto2#106）。⚠ **`verify_credentials` は
+    # 投稿しない**ので、**叩いても当日の並びに影響しない。**
+    #
+    # 🔴 **これが無いと、失効に気付くのが 11/3 になる。**⚠ **8/15〜10/31 は 1 本も
+    # 投稿しない**ので痕跡が出ず、⚠⚠ **予告は 1 日 1 枠なので `failure_limit: 3` に
+    # 届くのに 3 日かかる**（11/1 → 11/3）。**気付いたときには前日。**
+    #
+    # ⚠⚠ **別スレッドで投げる。**🔴 **ここで待つと最悪 93 秒**（timeout 30 秒 × 再送 3）
+    # **初回の tick が遅れ、枠の頭 ＋ 拾う幅を過ぎて 1 枠落ちる**（→ makoto2#47 / makoto2#92）。
+    #
+    # ⚠ **失効（401 / 403）とそれ以外を分ける。**⚠⚠ **「Mastodon が落ちている」が
+    # 「トークンが死んでいる」に化けると、当日いちばん困る**（→ makoto2#124 と同じ形）。
+    # ⚠ **どちらでも常駐は止めない**（痕跡が書けないときと同じ扱い）。
+    #
+    # ⚠ **`/healthz` には載せない**（makoto2#106 で明示）。**Mastodon 側の一時的な不調で
+    # 「復旧させる」が叩かれる**ので、**ログに残すだけにする。**
+    #
+    # @return [Thread] ⚠ テストが待ち合わせに使う
+    def verify_credentials
+      return Thread.new do
+        account = MastodonService.new.account
+        logger.info(mastodon: 'verify_credentials', acct: account['acct'],
+          statuses: account['statuses_count'])
+      rescue Ginseng::AuthError => e
+        logger.error(mastodon: 'verify_credentials', message: 'token is not valid', error: e)
+      rescue => e
+        logger.warn(mastodon: 'verify_credentials', message: 'could not verify the token', error: e)
+      end
+    end
+
+    # ⚠⚠ **`Package.version` だけでは `0.6.0` のまま何コミットでも進む**ので、Sentry の「初出」
+    # 「regression」が箱の中で区別できない（makoto2#242 と同じ粗さ）。⚠ **常駐だけ**で上書きする —
+    # 🔴 **require 時に `Package.revision` を呼ぶと、全 CLI が `git` を fork する。**
+    def tag_sentry_release
+      revision = Package.revision
+      return unless revision && defined?(Sentry) && Sentry.initialized?
+      Sentry.configuration.release = "#{Package.version}+#{revision}"
+    rescue => e
+      logger.warn(sentry: 'release', error: e)
+    end
+
+    # 投稿先が申告する本文の上限と、`/mastodon/max_length` を突き合わせる（makoto2#351）。
+    #
+    # 🔴 **設定は手で書いた値**で、⚠⚠ **投稿先の上限は環境変数 1 つで変わる**（キュアスタ！の
+    # `MAX_CHARS`）。⚠ **下がった日は、取り込みが古い上限で全部通し、投稿の瞬間に 422 で枠が消える。**
+    #
+    # ⚠ **`verify_credentials` と同じく別スレッド・ログだけ・常駐は止めない。**
+    #
+    # @return [Thread] ⚠ テストが待ち合わせに使う
+    def verify_max_length
+      return Thread.new do
+        budget = PostBudget.new
+        declared = MastodonService.new.declared_max_length
+        payload = {mastodon: 'max_length', configured: budget.limit, declared: declared}
+        if (problem = budget.limit_mismatch(declared))
+          # 🔴 **`error` 欄に入れる**（makoto2#440）。⚠⚠ **`message` だけだと `rehearsal report` の受け皿
+          # （`count_unclassified`）が拾わず、上限が下がっていてもリハーサルが緑だった。**
+          logger.error(payload.merge(message: problem, error: problem))
+        else
+          logger.info(payload)
+        end
+      rescue => e
+        logger.warn(mastodon: 'max_length', message: 'could not read the limit', error: e)
+      end
+    end
+
+    # 起き上がったことを痕跡に残す（→ `Heartbeat.record_start`）。
+    #
+    # 🔴 **書けなくても常駐は止めない**（リリース前レビューの黄 1）。⚠⚠ **痕跡は
+    # 観測のためのもの**なので、**`Scheduler` 側の `record_tick` / `touch` はどちらも
+    # rescue の内側に置いてある**（`test/scheduler.rb` が「痕跡が書けなくても tick は
+    # 止めない」を保証している）。⚠ **ここだけ素で呼ぶと、`tmp/run` が書けないだけで
+    # `start` の rescue が再送出し**、🔴 **監視の口も投稿も立ち上がらないまま
+    # systemd が 5 秒ごとに叩き直す**（警告は stderr → `/dev/null`）。
+    def record_start
+      Heartbeat.record_start
+      return nil
+    rescue => e
+      logger.error(daemon: app_name, error: e)
+      return nil
+    end
+
+    # ⚠ **投稿の経路が使うのと同じ接続を掴む**（makoto2#80 の緑 5）。
+    #
+    # 🔴 **以前はここで別に `Sequel.connect` して PRAGMA を当てていたが、その接続は
+    # 誰も使っていなかった** — ⚠⚠ **原稿を引く口が使うのは `Database.connection` の
+    # ほう**なので、**WAL も busy_timeout も効いていなかった。**⚠ **PRAGMA は
+    # `Database.connect` に移した**ので、**この先増やすぶんも空振りしない。**
+    def connect_db
+      return Database.connection
+    end
+  end
+end
