@@ -108,7 +108,7 @@ package:
     - tkoishi@b-shock.co.jp
   license: MIT
   url: https://github.com/pooza/hadlar
-  version: 0.1.0
+  version: 0.1.1
 scheduler:
   heartbeat:
     interval: 1h
