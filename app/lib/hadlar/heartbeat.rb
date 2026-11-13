@@ -1,0 +1,494 @@
+module Hadlar
+  # 常駐が**仕事をしている**ことの痕跡。ハートビートのたびに書き換える。
+  #
+  # ⚠⚠ **ログだけでは外から判定できない。**ハートビートは syslog に出ているが、
+  # 監視から「最後に動いたのはいつか」を読むにはログの置き場と書式に依存することに
+  # なる。**1 ファイルに最新の 1 件だけ持たせて、そこだけ見れば済むようにする。**
+  #
+  # ⚠ **これは「進行位置の状態」ではない。**投稿の進行位置は時刻から計算する
+  # （→ `Timetable`）。ここに書くのは**観測のための痕跡だけ**で、消しても再起動後の
+  # 動作は何も変わらない（→ docs/CLAUDE.md「投稿の欠落は詰めない」）。
+  #
+  # ## 投稿の結末（makoto2#78）
+  #
+  # ⚠⚠ **「常駐が生きている」と「投稿が実際に出ている」は別物。**`jobs` は**起動時に
+  # 決まる登録の本数**なので、**160 枠すべてが失敗しても `jobs: 5` のまま**だった。
+  # そこで**枠の結末を 3 つに分けて**、失敗の側だけを数える。
+  #
+  # | 枠の結末 | 記録 | 理由 |
+  # | --- | --- | --- |
+  # | 投稿できた | `posted_at` を更新し `failures` を 0 に戻す | — |
+  # | ⚠ **本文が無い** | **何も記録しない（中立）** | **原稿が無い日は投稿しないのが正常。**⚠⚠ **`source` は正しく動いている** |
+  # | ⚠ **`source` が落ちた／投稿が失敗した** | `failed_at` を更新し `failures` を 1 つ進める | — |
+  #
+  # ⚠⚠ **「本文が無い」を中立に置くのが肝。**これを失敗に数えると、**投稿すべき原稿が
+  # 無いだけの日**（MAKOTO は 8/15〜10/31 の 2 か月半がこれ）が延々と赤くなる。逆に
+  # 成功に数えると、⚠ **makoto2#77 の「設定を消すと枠の中で例外が上がる」形が中立に紛れる**
+  # （その経路も本文が nil になるため）。**だから `source` の失敗と空の本文を、
+  # `PostingJob` の側で分けている。**
+  #
+  # ## 🔴 結末は枠ごとに持つ（makoto2#86）
+  #
+  # ⚠⚠ **`failures` を全枠で 1 つにしていたので、どれか 1 つが成功すると 0 に戻った。**
+  # 🔴 **`0.5` で毎日必ず成功する枠が 3 つ増える**（`morning` 08:00 / `song` 12:00・19:00）
+  # ので、⚠ **他の枠の連敗が 1 日 3 回打ち消され、`failure_limit` に構造的に届かなくなる。**
+  #
+  # ⚠ **いちばん痛い形**（**11/1〜11/3 の予告が毎日落ちる場合**）:
+  #
+  # ```
+  # 08:00 morning 成功(0) → 10:00 announcement 失敗(1) → 12:00 song 成功(0) → 19:00 song 成功(0)
+  # ```
+  #
+  # 🔴 **永久に 1 を超えない。**⚠⚠ **`/healthz/posting` は 200、`hadlar status` は
+  # 今日の成功を出す**ので**健全に見える** — **締め切りそのものの機能が、無警告で
+  # 3 日間出ないことになる。**
+  #
+  # ⚠ **v0.4.1 までは効いていた**（**平常日に投稿する枠が `announcement` だけ**だった
+  # ので **11/01 → 1、11/02 → 2、11/03 10:00 で 3** に達していた）。🔴 **`0.5` がその
+  # 検知を消すので、`0.5` で直す**（2026-09-08・`0.5` のリリース前レビューの赤 2）。
+  #
+  # ⚠⚠ **したがって結末は `posts` の下に枠の名前で分けて持ち、`record_success` は
+  # 自分の名前だけ 0 に戻す。**⚠ **`failures` は全枠の最大**（**どれか 1 つでも
+  # 閾値に達していれば鳴らす**）。
+  #
+  # ⚠ **`posted_at` / `failed_at` は全枠のものを残す**（**`status` の「最後に投稿できた
+  # のはいつか」は枠を跨いだ話**）。🔴 **枠ごとの時刻は `posts` の中にも持つ。**
+  #
+  # ⚠⚠ **版を上げた最初の 1 回は、古い痕跡の `failures` を引き継がない**（**どの枠の
+  # ぶんだったか分からない**）。⚠ **痕跡は観測のためだけのもので、消しても動作は
+  # 変わらない**（上記）ので、**そこは数え直しでよい。**
+  class Heartbeat
+    include Package
+
+    # ハートビートが止まったとみなすまでの倍率。⚠ **1 回の取りこぼしでは騒がない。**
+    STALE_FACTOR = 3
+
+    # ⚠ **痕跡の更新は読んで書き直す形。**`Scheduler` のハートビートと `PostingJob` の
+    # 結末は**別のスレッド**（rufus）から来るので、**素に書くと片方の更新が消える。**
+    #
+    # ⚠⚠ **これはプロセス内しか守らない。**プロセスをまたぐ側は `LOCK` が守る。
+    MUTEX = Mutex.new
+
+    # ⚠⚠ **プロセスをまたいだ read-modify-write を直列化する**（makoto2#81 のレビュー指摘）。
+    # ⚠ **常駐が一時的に 2 本になりうる** — `Health` が孤児で復旧を叩かせないのは
+    # まさにそれが起きるからで、**同じ前提をこちらでも置く**。
+    #
+    # ⚠ **実測**: 別プロセスと 300 回ずつ更新して、⚠⚠ **600 のはずが 142 しか
+    # 数えられなかった**（458 回ぶんの更新が消えた）。
+    LOCK_SUFFIX = '.lock'.freeze
+
+    # 二重に数えないために覚えておく枠の数。
+    #
+    # ⚠⚠ **同じ枠が 2 回実行されうる。**`Scheduler` は**登録直後に初回 tick を叩いて
+    # から `every` で回す**ので、⚠ **拾う幅（既定 10 秒）の内側で 2 回来ることがある**。
+    # **再起動が挟まれば毎回そうなる。**⚠⚠ **成功は冪等キーで Mastodon 側が畳むのに、
+    # 失敗だけ畳まれず、落ちた枠 1 つで閾値を 2 つ消費していた**（makoto2#81 の指摘・実測）。
+    #
+    # 🔴 **「成功は冪等キーで畳まれる」は実機で成立していなかった**（makoto2#109・2026-08-18。
+    # ⚠ **原因は上流の不具合で Mastodon `v4.7.2` で直った** — `with_idempotency` が
+    # `with_redis_lock` のブロックから `return` していた。→ docs/CLAUDE.md「投稿の
+    # 冪等キー」・makoto2#278）。
+    # ⚠ **プロセス内の重なりは `PostingJob#claim` が塞いだ**ので、⚠⚠ **ここに残るのは
+    # 再起動をまたぐ重なりだけ**（記憶はプロセスと一緒に消える）。**この数え直し防止は
+    # まだ要る。**
+    #
+    # ⚠ **覚える数を絞るのは、痕跡を無限に太らせないため。**同じ枠が重なるのは拾う幅
+    # （数秒）の内側だけなので、⚠⚠ **その間に来うる枠の数を上回っていれば足りる。**
+    #
+    # 🔴 **makoto2#86 で枠ごとに分けたので、いま数えるのは「1 つの枠が拾う幅の内側で重なる
+    # 回数」**（**ライブの 3 分間隔でも 1〜2**）。⚠ **32 は以前の「全枠ぶん」の名残で、
+    # 余裕は十分。**⚠⚠ **本数を書かない** — **枠は増える**（→ `feedback` の
+    # 「数字ではなく数え方を置く」）。
+    COUNTED_SLOTS = 32
+
+    class << self
+      # 🔴 **枠ごとの結末を読み書きする口**（makoto2#86 → `HeartbeatPosts`）。
+      # ⚠ **`class << self` の中で `include` するので、あちらのメソッドは
+      # `Heartbeat.` で呼べる。**
+      include HeartbeatPosts
+
+      # 🔴 **リハーサルが痕跡に残した未来の時刻を捨てる口**（makoto2#421 → `HeartbeatFuture`）。
+      include HeartbeatFuture
+
+      # 🔴 **メンションの受信の痕跡**（makoto2#29 → `HeartbeatStream`）。
+      include HeartbeatStream
+
+      # 🔴 **チャットボットの API キーが通らないことの痕跡**（makoto2#18 → `HeartbeatChat`）。
+      include HeartbeatChat
+
+      # ⚠ **テストは別のファイルに落とす。**`Environment.db` と同じ理由で、稼働中の
+      # 痕跡をテストが書き換えると `hadlar status` が嘘をつく。
+      def path
+        name = Environment.test? ? 'heartbeat_test.json' : 'heartbeat.json'
+        return File.join(Environment.dir, 'tmp/run', name)
+      end
+
+      # ⚠ **呼ぶ側（`Scheduler`）の rescue の内側で動く。**書けなくてもハートビート
+      # そのものを止めない。
+      #
+      # ⚠⚠ **投稿の結末（`posted_at` / `failed_at` / `failures`）を消さない。**ここは
+      # 1 時間ごとに動くので、素に書き直すと**枠の結末が毎時ぜんぶ消える。**
+      #
+      # 🔴 **`revision` と `job_names` も残す**（makoto2#242）。⚠⚠ **`version` と `jobs` の本数だけでは、
+      # 「マージしたあの修正が載っているか」「morning が登録されているか」に答えられない。**
+      #
+      # 🔴 **日付を騙していることも書く**（makoto2#174）。⚠⚠ **これを痕跡に置かないと、外から
+      # 誰も知る手段が無い** — ⚠ **`HADLAR_FAKE_TIME` は systemd の drop-in で常駐にだけ
+      # 渡る**ので、**あとから人が叩く CLI の `ENV` には入っていない**（→ makoto2#154）。
+      # ⚠⚠ **騙していなければ `nil` を書く** — **書かずに残すと、撤収したあとも前の
+      # リハーサルの値が居座る。**
+      #
+      # 🔴 **登録を見送った投稿も書く**（makoto2#350）。⚠⚠ **`jobs` の本数が減っただけでは、
+      # どれがなぜ減ったかを外から知る手段が無い。**⚠ **無ければ `{}` を書く**（前の起動の
+      # 値を居座らせない・`travel` と同じ）。
+      #
+      # ⚠ **`job_names` は渡されたときだけ書く**（makoto2#354）。🔴 **本数だけを渡す呼び出しを足した日に、
+      # 痕跡から名前が消えないように。**
+      def touch(jobs:, job_names: nil, rejected: nil, now: nil)
+        return update do |record|
+          record = record.merge(job_names: job_names) if job_names
+          record.merge(
+            at: (now || Time.now).getutc.iso8601,
+            jobs: jobs,
+            rejected: rejected || {},
+            version: Package.version,
+            revision: Package.revision,
+            pid: Process.pid,
+            # 🔴 **常駐自身の Sentry の状態**（makoto2#347・Codex の P1）。⚠⚠ **CLI が自分で初期化して言うと、
+            # 設定を変えて再起動していない日に、常駐と違う状態を言う。**
+            sentry: Hadlar.sentry_state.to_s,
+          )
+        end
+      end
+
+      # tick が 1 回まわった（makoto2#80 の黄 7）。
+      #
+      # 🔴 **`touch` とは別に持つ。**⚠⚠ **ハートビートは tick とは別の rufus ジョブ**
+      # なので、⚠ **tick 側だけが詰まっても `at` は更新され続ける** —
+      # **「生きているが投稿していない」を検知するための痕跡が、まさにその状態で
+      # 動き続ける**という形だった。
+      #
+      # ⚠ **記録するのは終わった時刻。**始めた時刻にすると、⚠⚠ **90 秒かかった tick が
+      # 「90 秒前に回った」ことになり、詰まりを短く見せる。**
+      #
+      # 🔴 **死んでいる別スレッドの名前も書く**（makoto2#611）。⚠⚠ 死んだスレッドは自分で痕跡を書けないので、
+      # 生きている tick が見て書く。⚠ 渡されたときだけ書き直す（空なら空で上書きする）。
+      def record_tick(now: nil, dead_threads: nil)
+        return update do |record|
+          record = record.merge(dead_threads:) if dead_threads
+          record.merge(ticked_at: (now || Time.now).getutc.iso8601)
+        end
+      end
+
+      # 常駐が起き上がったこと。🔴 **初回の tick が終わるまで `tick_stale?` を
+      # 鳴らさないための基準**（PR makoto2#98 の Codex 指摘）。
+      #
+      # ⚠⚠ **監視の口は初回 tick より先に開く**（→ `HadlarDaemon#start`）。⚠ **tick が
+      # 痕跡を書くのは枠を全部回し終えたあと**で、⚠⚠ **1 回の tick は投稿の再送で
+      # 90 秒以上かかりうる** — 🔴 **起き上がっただけで `/healthz` が赤くなる**形だった。
+      # ⚠ **前回の稼働が残した古い `ticked_at` も同じ**で、⚠⚠ **落ちて猶予より長く
+      # 空くと、戻ってきた瞬間から赤い。**
+      #
+      # ⚠ **猶予を過ぎても痕跡が無ければ、そこからは本物の詰まり**なので検知は残る。
+      #
+      # 🔴 **猶予を張り直すのは、前回の起動から tick が 1 回でも完走したときだけ**
+      # （リリース前レビューの黄 2）。⚠⚠ **無条件に書き換えると、起き上がるたびに
+      # 猶予が再武装される** — ⚠ **systemd は `Restart=always` / `RestartSec=5`** なので、
+      # 🔴 **初回 tick の途中で落ち続ける常駐は、tick の観点で永遠に健全を返す。**
+      # ⚠⚠ **makoto2#80 の黄 7 が消したかった「検知のための痕跡が、検知したい状態で更新され
+      # 続ける」構造そのもの**なので、ここで塞ぐ。
+      #
+      # 🔴 **未来の時刻は先に捨てる**（makoto2#421）。⚠⚠ **リハーサルは見かけの 11/4 で痕跡を書く**ので、
+      # **撤収して実時間で起き直すと `ticked_at` / `started_at` / `failed_at` が未来に残る** —
+      # ⚠ **`tick_stale?` は未来の基準で止まりを見逃し、`failing?` は `failure_stale` を超えずに
+      # 6 週間ほど鳴り続けていた。**⚠ **捨てるのは起き上がりのときだけ**（読む側で捨てると、
+      # リハーサル中の失敗を外から見られなくなる）。
+      #
+      # 🔴 **日付を騙している間は、未来の `started_at` / `ticked_at` だけを捨てる**（PR makoto2#434 の Codex の
+      # P1 ×2・makoto2#442）。⚠⚠ **リハーサル中に落ちて起き直した常駐は、見かけの時刻を開始時刻からやり直す**
+      # ので、**同じリハーサルの記録が「未来」に見える** — ⚠ **失敗まで捨てると証拠が消える。**
+      # 🔴 **`ticked_at` を残すと、初回 tick が詰まっても見かけの時刻が追いつくまで stale にならない。**
+      #
+      # 🔴🔴 **騙している間は、上のクラッシュループの塞ぎが効かない**（makoto2#442・退行ではない）。
+      # ⚠⚠ **`started_at` を据え置いても、比べる `now` 自体が起き直すたびに開始時刻へ戻る**ので、
+      # **猶予は実質張り直される**（scale 12・`tick_limit` 5m なら、実時間 25 秒未満で落ち続ける
+      # 常駐は stale にならない）。⚠ **リハーサル中のクラッシュループは `rehearsal report` で見る** —
+      # **起き上がりで落ちた常駐は `{daemon:, error:}` を出すので受け皿（`count_unclassified`）で赤。**
+      def record_start(now: nil)
+        time = now || Time.now
+        return update do |record|
+          # ⚠ **前の常駐が書いた死んだスレッドを消す**（v1.0.1 のリリース前レビュー）— 止める途中の tick が、殺した
+          # スレッドを書きうる。消さないと、起き上がってから最初の tick までの間、いまの常駐の warning に見える。
+          cleaned = forget_future(record, time).except(:dead_threads)
+          started = parse_time(cleaned[:started_at])
+          ticked = parse_time(cleaned[:ticked_at])
+          # ⚠ 前回の猶予がまだ 1 回も tick で解消されていなければ、据え置く。
+          next cleaned if started && (ticked.nil? || ticked < started)
+          cleaned.merge(started_at: time.getutc.iso8601)
+        end
+      end
+
+      # 枠が 1 つ投稿できた。⚠ **失敗の数を 0 に戻す。**
+      #
+      # 🔴 **戻すのは自分の枠だけ**（makoto2#86）。⚠⚠ **全枠まとめて戻すと、毎日必ず成功する
+      # 枠が他の枠の連敗を打ち消す**（→ このクラスの冒頭「結末は枠ごとに持つ」）。
+      #
+      # @param post [String] 枠の名前（`PostingJob#name`）。⚠ **省くと 1 つの束に入る**
+      def record_success(post: nil, now: nil)
+        time = (now || Time.now).getutc.iso8601
+        return update do |record|
+          cleared = merge_post(record, post, failures: 0, slots: [], posted_at: time)
+          cleared.merge(posted_at: time)
+        end
+      end
+
+      # 枠が 1 つ落ちた（`source` の例外・投稿の失敗）。
+      #
+      # ⚠ **数えるのは「最後の成功からの連続」。**⚠⚠ **1 本の取りこぼしで騒がない**
+      # のはハートビートの `STALE_FACTOR` と同じ考え方だが、⚠ **こちらは時間ではなく
+      # 本数で見る** — MAKOTO は平常日に数本しか投稿しないので、**時間で見ると
+      # ライブ当日（3 分間隔）と平常日で意味が変わってしまう。**
+      #
+      # @param post [String] 枠の名前（`PostingJob#name`）。⚠ **省くと 1 つの束に入る**
+      # @param slot [String] 枠の識別子（`PostingJob#idempotency_key`）。
+      #   ⚠⚠ **同じ枠を 2 度数えない**（→ `COUNTED_SLOTS`）。⚠ **省くと毎回数える。**
+      def record_failure(post: nil, slot: nil, now: nil)
+        time = (now || Time.now).getutc.iso8601
+        return update do |record|
+          current = post_record(record, post)
+          counted = Array(current[:slots])
+          # ⚠ 既に数えた枠なら、時刻だけ進めて数は据え置く。
+          if slot && counted.include?(slot)
+            next merge_post(record, post, failed_at: time).merge(failed_at: time)
+          end
+          values = {
+            failed_at: time,
+            failures: current[:failures].to_i + 1,
+            slots: slot ? counted.push(slot).last(COUNTED_SLOTS) : counted,
+          }
+          merge_post(record, post, **values).merge(failed_at: time)
+        end
+      end
+
+      # ⚠ **読んで書き直す。**⚠⚠ **`read` ではなく `stored` から読む** — 時刻の欠けた
+      # 痕跡は `read` が nil にするので、そちらを使うと**書き直すたびに投稿の結末が
+      # 消える。**
+      #
+      # ⚠ **守りは 2 段。**`MUTEX` がプロセス内のスレッド（rufus のハートビートと
+      # tick）、`flock` がプロセスまたぎ（再起動で一時的に 2 本になる形）。
+      def update
+        MUTEX.synchronize do
+          with_lock do
+            record = yield(stored)
+            write(record)
+            return record
+          end
+        end
+      end
+
+      # ⚠ **鍵は痕跡そのものとは別のファイル。**痕跡は `write` が rename で置き換える
+      # ので、⚠⚠ **同じファイルを掴むと、鍵を持ったまま実体が別の inode に入れ替わる。**
+      def lock_path
+        return path + LOCK_SUFFIX
+      end
+
+      # 保存されているものをそのまま。⚠ **`read` と違って `at` の有無を問わない。**
+      # ⚠⚠ **読めないときも `{}` で、nil を返さない** — これを使うのは「消さずに
+      # 引き継ぐ」ためなので、読めないことと空であることを区別する意味が無い。
+      def stored
+        return {} unless File.file?(path)
+        record = JSON.parse(File.read(path), symbolize_names: true)
+        return record.is_a?(Hash) ? record : {}
+      rescue JSON::ParserError, SystemCallError
+        return {}
+      end
+
+      # ⚠ **壊れていたら nil。**中身を信じて「健全」と誤答するより、読めないことを
+      # 上に返す。⚠⚠ **時刻の欠けた痕跡も読めないものとして扱う**（経過が出せない）。
+      def read
+        record = stored
+        return nil if record[:at].blank?
+        return record
+      end
+
+      # 最後に投稿できた時刻／最後に落ちた時刻。⚠ **一度も無ければ nil。**
+      def posted_at
+        return parse_time(stored[:posted_at])
+      end
+
+      def failed_at
+        return parse_time(stored[:failed_at])
+      end
+
+      # 最後に tick が回った時刻。⚠ **一度も無ければ nil**（起動直後・旧い痕跡）。
+      def ticked_at
+        return parse_time(stored[:ticked_at])
+      end
+
+      # 最後に常駐が起き上がった時刻。⚠ **一度も無ければ nil**（→ `record_start`）。
+      def started_at
+        return parse_time(stored[:started_at])
+      end
+
+      # 🔴 **痕跡を書いた常駐が日付を騙していたか**（makoto2#174 → `touch`）。⚠ **騙していなければ nil。**
+      #
+      # ⚠⚠ **旧い痕跡（makoto2#174 より前の常駐）にはこの項目が無い**ので、**同じく nil になる** —
+      # ⚠ **「騙していない」と「分からない」を分けていない。**🔴 **分けても人にできることが
+      # 変わらない**（どちらでも `systemctl show hadlar -p Environment` を見る）。
+      def travel
+        return stored[:travel]
+      end
+
+      def jobs
+        record = read
+        return nil unless record
+        return record[:jobs]
+      end
+
+      # 起動時に登録を見送った投稿と理由（makoto2#350）。⚠ **旧い痕跡・見送り無しは空。**
+      def rejected
+        found = read&.dig(:rejected)
+        return found.is_a?(Hash) ? found.transform_keys(&:to_s) : {}
+      end
+
+      # 最後のハートビートからの経過（秒）。⚠ **読めなければ nil。**
+      def age(now = nil)
+        record = read
+        return nil unless record
+        return (now || Time.now) - Time.parse(record[:at])
+      rescue ArgumentError
+        return nil
+      end
+
+      # ⚠ **壊れた時刻は nil。**痕跡は観測のためのものなので、読めないことを上に返す。
+      def parse_time(value)
+        return nil if value.blank?
+        return Time.parse(value)
+      rescue ArgumentError
+        return nil
+      end
+
+      # ⚠ **閾値は設定から出す。**ハートビートの間隔を変えたときに閾値が置き去りに
+      # なると、**間隔を延ばした瞬間に監視が誤検知しはじめる**。
+      def limit
+        seconds = Fugit::Duration.parse(config['/scheduler/heartbeat/interval'].to_s)&.to_sec
+        unless seconds&.positive?
+          raise Ginseng::ConfigError,
+            "heartbeat: bad interval '#{config['/scheduler/heartbeat/interval']}'"
+        end
+        return seconds * STALE_FACTOR
+      end
+
+      # ⚠ **読めない場合も「止まっている」と扱う。**
+      def stale?(now = nil)
+        seconds = age(now)
+        return true unless seconds
+        return seconds > limit
+      end
+
+      # tick が止まったとみなすまでの猶予（秒）。⚠ **閾値は設定から出す**（`limit` と
+      # 同じ理由）。⚠⚠ **tick の間隔から導かない** — **1 回の tick は投稿の再送で
+      # 90 秒以上かかりうる**ので、間隔の倍数にすると誤報する。
+      def tick_limit
+        seconds = Fugit::Duration.parse(config['/scheduler/tick_stale'].to_s)&.to_sec
+        unless seconds&.positive?
+          raise Ginseng::ConfigError,
+            "heartbeat: bad tick_stale '#{config['/scheduler/tick_stale']}'"
+        end
+        return seconds
+      end
+
+      # tick が回らなくなっているか（makoto2#80 の黄 7）。
+      #
+      # ⚠⚠ **痕跡が無いときも「止まっている」と扱う。**⚠ **常駐は登録の直後に 1 回
+      # 叩く**（→ `Scheduler#schedule_posts`）ので、⚠⚠ **生きているのに痕跡が無いのは、
+      # tick が一度も回っていないということ。**
+      #
+      # ⚠⚠ **ただし基準は「最後の tick」と「起き上がった時刻」の新しいほう。**
+      # 🔴 **初回の tick は枠を回し終えるまで痕跡を書かない**ので、⚠ **起き上がった
+      # 直後を「一度も回っていない」と読むと、起動のたびに赤くなる**（→ `record_start`）。
+      # ⚠⚠ **猶予を過ぎればどちらの基準でも赤い**ので、検知そのものは緩まない。
+      def tick_stale?(now = nil)
+        last = [ticked_at, started_at].compact.max
+        return true unless last
+        return ((now || Time.now) - last) > tick_limit
+      end
+
+      # 何本続けて落ちたら異常とみなすか。⚠ **閾値は設定から出す**（`limit` と同じ理由）。
+      #
+      # ⚠⚠ **欠けたら例外にする。**`optional_config` で既定値に逃がすと、⚠ **設定を
+      # 消しただけで検知が静かに緩む**（makoto2#77 の裏返し）。**schema で必須にしてあるので
+      # `rake config:lint` が先に止める。**
+      def failure_limit
+        count = config['/scheduler/posting/failure_limit']
+        unless count.is_a?(Integer) && count.positive?
+          raise Ginseng::ConfigError, "posting: bad failure_limit '#{count}'"
+        end
+        return count
+      end
+
+      # 落ちた記録が警告を出し続ける長さ（秒）。⚠ **設定が無ければ nil ＝ 期限なし。**
+      #
+      # 🔴 **makoto2#86 で結末を枠ごとに分けたことの副作用を塞ぐ**（Codex の P2）。
+      # ⚠⚠ **分ける前は「どれか 1 つでも成功すれば 0 に戻る」ので古い失敗が自然に
+      # 掃除されていた** — ⚠ **分けた後は、その枠自身が次に成功するまで消えない。**
+      #
+      # 🔴 **年に 1 日しか動かない枠がある**（`live-eve` / `live-open` / `live-close`）。
+      # ⚠⚠ **その日の最後の枠が落ちると、`/healthz/posting` が翌年まで 503 のまま。**
+      # ⚠ **赤が常態化すると誰も見なくなる**ので、**本物の警告が埋もれる。**
+      #
+      # ⚠ **`optional_config` で読む**（消せば元の「永久」に戻る → makoto2#77）。⚠⚠ **ただし
+      # 値が壊れていたら例外**（**黙って期限なしに落ちると、この塞ぎが効かない**）。
+      def failure_stale
+        key = '/scheduler/posting/failure_stale'
+        # ⚠ **`Package#optional_config` はインスタンス側の口**なので、ここは
+        # `config.key?` で同じことをする（→ `Package`）。
+        return nil unless config.key?(key)
+        value = config[key]
+        return nil if value.blank?
+        seconds = Fugit::Duration.parse(value.to_s)&.to_sec
+        unless seconds&.positive?
+          raise Ginseng::ConfigError, "posting: bad failure_stale '#{value}'"
+        end
+        return seconds
+      end
+
+      # ⚠ **投稿が続けて落ちているか。**⚠⚠ **本文の無い枠は数に入っていない**ので、
+      # **原稿が無いだけの日は何本過ぎても false**（→ このクラスの冒頭の表）。
+      def failing?(now: nil)
+        return failing_posts(now: now).any?
+      end
+
+      private
+
+      # ⚠ **プロセスをまたいだ read-modify-write を直列化する。**⚠⚠ **`Mutex` は
+      # プロセス内のスレッドしか守らない**ので、**再起動で一時的に 2 本になる形では
+      # 片方の更新が消える**（→ `LOCK_SUFFIX`）。
+      def with_lock
+        FileUtils.mkdir_p(File.dirname(path))
+        File.open(lock_path, File::CREAT | File::RDWR, 0o644) do |lock|
+          lock.flock(File::LOCK_EX)
+          return yield
+        end
+      end
+
+      # ⚠⚠ **書き込みは差し替えで行う。**`File.write` は**切り詰めてから書く**ので、
+      # ⚠ **その隙に読んだ側は壊れた JSON を掴む。**
+      #
+      # ⚠⚠ **これは「監視のせいで監視が誤報する」形だった** — 読めない痕跡は
+      # `stale?` が true になり、**`hadlar status` が 1（復旧させる）を返して monit が
+      # 正常な常駐を再起動する。**⚠ **投稿ごとに書くようになって窓が一気に広がった**
+      # （1 時間に 1 回 → ライブ当日は 160 回）。⚠ **実測で 2,000 回中 625 回が nil。**
+      #
+      # ⚠ **rename は同じディレクトリの中なので不可分。**⚠⚠ **読む側は鍵を取らなくて
+      # よい**（`hadlar status` を待たせない）。
+      def write(record)
+        temp = "#{path}.#{Process.pid}.tmp"
+        File.write(temp, record.to_json)
+        File.rename(temp, path)
+      ensure
+        FileUtils.rm_f(temp)
+      end
+    end
+  end
+end

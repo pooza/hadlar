@@ -1,0 +1,756 @@
+require 'tmpdir'
+
+module Hadlar
+  class DaemonTest < TestCase
+    def setup
+      @daemon = HadlarDaemon.new
+    end
+
+    # 🔴 **登録は曲紹介の履歴を 1 回読む**（makoto2#274 → `Song#validate_history`）。⚠⚠ **既定の
+    # 接続は空の `test.db` に落ちる**（→ `Environment.db`）ので、**マイグレーション済みの
+    # メモリ DB を掴ませる。**
+    def with_migrated_connection
+      original = Database.instance_variable_get(:@connection)
+      Database.instance_variable_set(:@connection, empty_db)
+      return yield
+    ensure
+      Database.instance_variable_set(:@connection, original)
+    end
+
+    # pid ファイルと `/proc` を差し替えた常駐。⚠ **番号は本物**（`Process.kill(0)` が
+    # 通らないと `alive?` がそこで false になり、身元の判定まで届かない）。
+    def with_daemon(command: nil, proc_dir: nil, pid: Process.pid)
+      Dir.mktmpdir do |dir|
+        FileUtils.mkdir_p(File.join(dir, 'tmp/pids'))
+        fake = proc_dir || File.join(dir, 'proc')
+        if command
+          entry = File.join(fake, pid.to_s)
+          FileUtils.mkdir_p(entry)
+          # ⚠ 実機は NUL 区切りで、末尾に詰め物が付く。
+          File.write(File.join(entry, 'cmdline'), "#{Array(command).join("\0")}\0\0\0")
+        end
+        daemon = HadlarDaemon.new(working_dir: dir, proc_dir: fake)
+        File.write(daemon.pid_file, pid.to_s) unless pid.nil?
+        yield daemon
+      end
+    end
+
+    # その項目の stat が拒まれるか。⚠ **`File.directory?` と違い、「無い」と
+    # 「拒まれた」を分ける。**
+    def stat_denied?(entry)
+      File.stat(entry)
+      return false
+    rescue Errno::EACCES
+      return true
+    end
+
+    def test_alive_without_a_pid_file
+      with_daemon(pid: nil) do |daemon|
+        assert_false(daemon.alive?)
+      end
+    end
+
+    # 🔴 **空・壊れた pid ファイルを「動いている」と答えない**（リリース前レビューの黄 3）。
+    #
+    # ⚠⚠ **`1.23.5` までは `pid = 0` になっていた**（`File.read(...).to_i`）。⚠ **`0` は
+    # truthy で、`Process.kill(0, 0)` は自分のプロセスグループ宛てなので成功する**ため、
+    # 🔴 **`run_restart` が `Process.kill('TERM', 0)` ＝ 呼び出し元のプロセスグループ
+    # 全体に TERM を送る**形だった。
+    #
+    # ✅ **`1.23.6` で上流が `parse_pid` を入れ、`nil` に倒すようになった**（makoto2#257）。
+    # ⚠ **`'12_34'`（Ruby は桁区切りとして受ける）と `pid_t` を超える数も足した** —
+    # ⚠⚠ **`to_i` の時代は通っていた形。**
+    def test_a_broken_pid_file_is_not_the_daemon
+      ['', "\n", 'abc', '0', '12_34', '9999999999'].each do |body|
+        with_daemon(pid: nil) do |daemon|
+          File.write(daemon.pid_file, body)
+
+          assert_nil(daemon.pid, "pid file: #{body.inspect}")
+          assert_false(daemon.alive?, "pid file: #{body.inspect}")
+        end
+      end
+    end
+
+    # 🔴 **makoto2#200 の本体 — pid ファイルを 1 回しか読まない。**⚠⚠ **前は `alive_state` を
+    # 上書きして `super` のあとに `pid` を読み直していた**ので、⚠ **2 回の読みの間に
+    # 書き換わると「A の生死」に「B の身元」を掛けた答え**になった。
+    #
+    # ✅ **v1.24.0 の `alive_state_of(found)` へ移して消えた**（上流 `ginseng-core#638`）。
+    # ⚠ **`pid` を 1 回しか呼ばないことを数えて確かめる** — 🔴 **2 回目以降が別の番号を
+    # 返す形にしておき、それが答えに混ざらないことまで見る。**
+    def test_the_pid_file_is_read_only_once
+      with_daemon(command: ['bin/hadlar_daemon.rb start']) do |daemon|
+        reads = []
+        real = daemon.method(:pid)
+        daemon.define_singleton_method(:pid) do
+          reads.push(reads.empty? ? real.call : 999_999)
+          reads.last
+        end
+
+        assert_equal(:alive, daemon.alive_state)
+        assert_equal(1, reads.size, '2 回目の読みが起きている')
+        assert_equal(Process.pid, reads.first)
+      end
+    end
+
+    # 🔴 **番号が取れなかったときの答えは上流が決める**（makoto2#257 → 上流 `ginseng-core#635`）。
+    # ⚠⚠ **`pid` は「無い」も「読めない」も `nil` に畳む**ので、⚠ **「読めない」を
+    # `:dead` と答えると `run_restart` が `run_stop` を飛ばし、生きている常駐の横に
+    # 2 本目が立つ**（**8 時間の配信中なら、そのまま全枠が二重投稿**）。
+    #
+    # ✅ **`alive_state_of` は `found` を受け取るだけなので、この分岐はこちらに無い。**
+    # ⚠ **上流に残っていることを確かめる**（🔴 **`pid_file_unreadable?` は「在るのに
+    # 読めなかった」だけを指し、`ENOENT` では立たない**）。
+    def test_an_unreadable_pid_file_is_not_dead
+      with_daemon(command: ['bin/hadlar_daemon.rb start']) do |daemon|
+        daemon.define_singleton_method(:pid) {nil}
+        daemon.define_singleton_method(:pid_file_unreadable?) {true}
+
+        assert_equal(:unknown, daemon.alive_state)
+        assert_false(daemon.alive?)
+      end
+    end
+
+    # 🔴 **逆に、消えたのなら `:dead`**（Codex の P2）。⚠ **これを `:unknown` と答えると
+    # `run_restart` が `run_stop` へ入り、番号が無いので `abort_stop!` で落ちて
+    # 後継を起動しないまま終わる。**
+    def test_a_vanished_pid_file_is_dead
+      with_daemon(command: ['bin/hadlar_daemon.rb start']) do |daemon|
+        daemon.define_singleton_method(:pid) {nil}
+
+        assert_false(daemon.pid_file_unreadable?, '前提: 読めなかった記録は無い')
+        assert_equal(:dead, daemon.alive_state)
+      end
+    end
+
+    # ⚠ 本物の常駐は生きていると答える（**塞いだせいで検知できなくならないこと**）。
+    def test_the_real_daemon_is_alive
+      with_daemon(command: ['bin/hadlar_daemon.rb start']) do |daemon|
+        assert_true(daemon.alive?)
+      end
+    end
+
+    # 🔴 **makoto2#80 の黄 6 の本体。**⚠⚠ **pid は再利用される。**⚠ `Process.kill(0, pid)` は
+    # 「その番号が在るか」しか見ないので、**無関係なプロセスを常駐だと答えていた**
+    # （実測 — `sleep 300` の pid を書くと `running (PID 354866)` と表示された）。
+    def test_a_reused_pid_is_not_the_daemon
+      with_daemon(command: ['sleep', '300']) do |daemon|
+        assert_false(daemon.alive?)
+      end
+    end
+
+    # ⚠⚠ **孤児の判定（makoto2#61）と同じ規則で見る。**⚠ argv にこの名前を含むだけの
+    # 運用スクリプトを常駐と取り違えない（`bash -lc '… hadlar_daemon.rb restart'`）。
+    def test_a_wrapper_script_is_not_the_daemon
+      with_daemon(command: ['bash', '-lc', 'bundle exec bin/hadlar_daemon.rb restart']) do |daemon|
+        assert_false(daemon.alive?)
+      end
+    end
+
+    # ⚠⚠ **`status` は即座に終わるので常駐ではない**（makoto2#80 の緑 6）。⚠ pid ファイルが
+    # そこを指しているなら、それは実体とずれている。
+    def test_a_transient_subcommand_is_not_the_daemon
+      with_daemon(command: ['bin/hadlar_daemon.rb status']) do |daemon|
+        assert_false(daemon.alive?)
+      end
+    end
+
+    # ⚠ インタプリタ越しでも本物は本物（`ruby --yjit bin/hadlar_daemon.rb start`）。
+    def test_the_daemon_behind_interpreter_options_is_alive
+      with_daemon(command: ['ruby', '--yjit', 'bin/hadlar_daemon.rb', 'start']) do |daemon|
+        assert_true(daemon.alive?)
+      end
+    end
+
+    # ⚠⚠ **確かめられないときは「生きている」に倒す。**⚠ `/proc` の無い環境で
+    # 「死んでいる」と答えると、**健全な常駐の横にもう 1 本立ち上がる。**
+    def test_alive_falls_back_without_proc
+      with_daemon(proc_dir: File.join(Dir.tmpdir, 'hadlar-no-such-proc')) do |daemon|
+        assert_true(daemon.alive?)
+      end
+    end
+
+    # ⚠ **本物の `/proc` で見る。**⚠⚠ **テストプロセス自身の pid を書いても
+    # 「動いている」と答えないこと**（差し替えた `/proc` だけで通る形にしない）。
+    def test_a_foreign_pid_is_not_the_daemon_on_the_real_proc
+      with_daemon(proc_dir: ProcessIdentity::PROC_DIR) do |daemon|
+        assert_false(daemon.alive?)
+      end
+    end
+
+    # ⚠ **`Process.kill` で止める。**⚠⚠ **本物の `EPERM` を作ると他人のプロセスへ
+    # signal を送ることになる。**
+    #
+    # 🔴 **`send_signal` は差し替えない**（makoto2#187）— ⚠⚠ **身元の判定はそこに置いてある**
+    # ので、**差し替えると見たい判定ごと消える。**
+    #
+    # ⚠ **シグナル 0（在否の確かめ）は数えない。**`ginseng-core` 2.2.0 から上流の
+    # `run_stop` が送る前に `alive_state_of` へ訊く（上流 `ginseng-core#673`）ので、0 が 2 本混ざる。
+    # ⚠ 0 は相手に何も起こさない。見たいのは「誰に TERM を送ったか」だけ（makoto2#486）。
+    def with_captured_kill(error: nil)
+      sent = []
+      original = Process.method(:kill)
+      Process.define_singleton_method(:kill) do |signal, target|
+        raise error if error
+        next 1 if signal.to_s == '0'
+        sent.push([target, signal])
+        next 1
+      end
+      yield sent
+    ensure
+      Process.define_singleton_method(:kill, original)
+    end
+
+    # ⚠ 在否の答えそのものを差し替える。⚠⚠ **`EPERM` を本物で作れない**のは同じ理由。
+    def with_alive_state(state)
+      original = Process.method(:alive_state)
+      Process.define_singleton_method(:alive_state) {|_pid| state}
+      yield
+    ensure
+      Process.define_singleton_method(:alive_state, original)
+    end
+
+    # 🔴 **makoto2#111 の本体（1）。**⚠⚠ **`EPERM` は「居るが signal を送れない」。**
+    # ⚠ **1.15.28 の `alive?` は `EPERM` も false に倒していた**ので、🔴 **他人の権限で
+    # 走っている常駐が「死んでいる」と読まれ、二重に起動しうる。**
+    #
+    # ✅ **上流は `:unknown` という 3 つ目の答えにした**（`pooza/ginseng-core#510`）。
+    # ⚠⚠ **`alive?` は false のまま**（真偽 2 値の述語なのでそれでよい）だが、
+    # 🔴 **`run_start` / `run_restart` は `alive_state` を見るので二重起動しない。**
+    # ⚠ **身元の判定は `:alive` のときだけ効く**ので、ここは素通しになる。
+    def test_a_permission_error_is_unknown
+      with_daemon(command: ['bin/hadlar_daemon.rb start']) do |daemon|
+        with_alive_state(:unknown) do
+          assert_equal(:unknown, daemon.alive_state)
+          assert_false(daemon.alive?)
+        end
+      end
+    end
+
+    # ⚠ 居ないものは死んでいる（塞いだせいで検知できなくならないこと）。
+    def test_no_such_process_means_dead
+      with_daemon(command: ['bin/hadlar_daemon.rb start']) do |daemon|
+        with_alive_state(:dead) do
+          assert_equal(:dead, daemon.alive_state)
+          assert_false(daemon.alive?)
+        end
+      end
+    end
+
+    # 🔴 **makoto2#111 の本体（2）。**⚠⚠ **上流は先に pid ファイルを消してから TERM を送り、
+    # `EPERM` を拾っていない** — 🔴 **pid ファイルだけ消えてプロセスは生き残る
+    # ＝ 孤児が確定する。**⚠ **旧実装が孤児を 11 日分撒いた形。**
+    def test_run_stop_keeps_the_pid_file_when_it_cannot_signal
+      with_daemon(command: ['bin/hadlar_daemon.rb start']) do |daemon|
+        with_captured_kill(error: Errno::EPERM) do
+          assert_raise(SystemExit) {daemon.send(:run_stop)}
+          assert_path_exist(daemon.pid_file)
+        end
+      end
+    end
+
+    # ⚠ 送れたら消す（従来どおり）。**順序だけを入れ替えている。**
+    def test_run_stop_removes_the_pid_file_after_terminating
+      with_daemon(command: ['bin/hadlar_daemon.rb start']) do |daemon|
+        with_captured_kill do |sent|
+          daemon.send(:run_stop)
+
+          assert_equal([[Process.pid, 'TERM']], sent)
+          assert_path_not_exist(daemon.pid_file)
+        end
+      end
+    end
+
+    # 🔴 **makoto2#187（Codex の P1）。**⚠⚠ **確かめた pid と、実際に送る pid が
+    # 別物になりうる** — ⚠ **上流の `run_stop` は pid ファイルを読み直す**ので、
+    # **確かめてから送るまでの間に後継が新しい pid を書くと、身元を確かめていない
+    # 相手へ `TERM` が飛ぶ。**
+    #
+    # ⚠ **判定を「送る 1 点」に置いてあれば、読み直した番号のほうが判定を通る。**
+    def test_run_stop_signals_the_pid_it_checked
+      with_daemon(command: ['bin/hadlar_daemon.rb start']) do |daemon|
+        # ⚠⚠ **後継は別物**（`sleep 300`）。**身元の判定を通らない番号。**
+        successor = Process.pid + 1
+        entry = File.join(daemon.instance_variable_get(:@proc_dir), successor.to_s)
+        FileUtils.mkdir_p(entry)
+        File.write(File.join(entry, 'cmdline'), "#{['sleep', '300'].join("\0")}\0")
+        # ⚠ **1 回目は常駐の番号、2 回目からは後継の番号**（＝ pid ファイルを
+        # 読み直すたびに変わる形）。
+        reads = [Process.pid]
+        daemon.define_singleton_method(:pid) {reads.shift || successor}
+        with_captured_kill do |sent|
+          daemon.send(:run_stop)
+
+          # 🔴 **判定を通った番号にだけ送る。**⚠⚠ **手前で確かめて `super` に渡す形
+          # だと、ここが後継の番号になる**（＝ 身元を確かめていない相手へ TERM）。
+          assert_equal([[Process.pid, 'TERM']], sent)
+        end
+      end
+    end
+
+    # 🔴 **makoto2#199（v0.4.0 のリリース前レビューの黄）。**⚠⚠ **後継が既に自分の番号を
+    # 書いていたら pid ファイルを消さない。**
+    #
+    # ⚠ **成立の形**: pid ファイルが「生きているが常駐ではない番号」を指しており
+    # （常駐が後始末せずに死に、OS が pid を再利用した）、⚠⚠ **`run_stop` が
+    # `p = pid` を読んでから `stoppable?` が `remove_pid` に達するまでの間に
+    # 後継が pid ファイルを書く。**
+    #
+    # 🔴 **消すと後継は生きたままどの pid ファイルからも辿れなくなる ＝ 孤児が確定
+    # する。**⚠⚠ **次の `run_start` は `abort_if_running!` を素通りするので 2 本目が
+    # 立ち、8 時間の配信中ならそのまま二重投稿。**
+    def test_stoppable_keeps_the_pid_file_written_by_a_successor
+      with_daemon(command: ['sleep', '300']) do |daemon|
+        # ⚠ 再利用された古い番号（＝ 身元を確かめると常駐ではない）。
+        stale = daemon.pid
+        # ⚠⚠ **後継が自分の番号を書いた後**の状態を作る。
+        successor = Process.pid + 1
+        File.write(daemon.pid_file, successor.to_s)
+
+        assert_false(daemon.send(:stoppable?, stale))
+        assert_path_exist(daemon.pid_file)
+        assert_equal(successor, daemon.pid, '後継の番号がそのまま残ること')
+      end
+    end
+
+    # ⚠ **中身がまだその番号なら従来どおり消す**（makoto2#199 で消さなくなっていないこと）。
+    # ⚠⚠ **残すと `run_start` が「already running」で無言終了する**（makoto2#80 の黄 6）。
+    def test_stoppable_removes_the_pid_file_it_still_owns
+      with_daemon(command: ['sleep', '300']) do |daemon|
+        assert_false(daemon.send(:stoppable?, daemon.pid))
+        assert_path_not_exist(daemon.pid_file)
+      end
+    end
+
+    # 🔴 **makoto2#162 の受け皿は上流へ移った**（makoto2#257・上流 `ginseng-core#627`）。
+    #
+    # ⚠⚠ **`1.23.5` までは空・壊れた pid ファイルが `0` になり、`0` は truthy なので
+    # `unless (target = pid)` を素通りしていた** — ⚠ **そのまま送ると
+    # `Process.kill('TERM', 0)` ＝ 呼び出し元のプロセスグループ全体に TERM。**
+    # 🔴 **こちらの `stoppable?` がそれを止めていた。**
+    #
+    # ✅ **いまは `run_stop` の冒頭で `abort_stop!` に落ちる**ので、⚠ **`stoppable?` まで
+    # 来ない。**⚠⚠ **pid ファイルは残る**（🔴 **`1.23.5` までは消していた**）— **次の
+    # `run_start` が `write_pid` で原子的に奪うので、残っても詰まらない**（上流 ginseng-core#622）。
+    #
+    # ⚠ **送らないことは変わっていない。**🔴 **確かめるのは「TERM が飛ばないこと」**で、
+    # **どちらの層が止めたかではない。**
+    def test_run_stop_does_not_signal_a_broken_pid_file
+      ['', "\n", 'abc', '0'].each do |body|
+        with_daemon(command: ['sleep', '300']) do |daemon|
+          File.write(daemon.pid_file, body)
+          with_captured_kill do |sent|
+            assert_raise(SystemExit, "pid file: #{body.inspect}") {daemon.send(:run_stop)}
+
+            assert_equal([], sent, "pid file: #{body.inspect}")
+            assert_path_exist(daemon.pid_file, "pid file: #{body.inspect}")
+          end
+        end
+      end
+    end
+
+    # ⚠⚠ **残した pid ファイルが次の起動を塞がないこと**（上記の帰結の確認）。
+    # 🔴 **上流は「pid として読めない中身」を生死を訊かずに奪う**（makoto2#622）ので、
+    # ⚠ **`write_pid` が自分の番号を書けて `run_start` が進む。**
+    def test_a_broken_pid_file_is_reclaimed_by_the_next_start
+      with_daemon(pid: nil) do |daemon|
+        File.write(daemon.pid_file, 'abc')
+
+        assert_nothing_raised {daemon.send(:abort_if_running!)}
+        assert_nothing_raised {daemon.send(:write_pid)}
+        assert_equal(Process.pid, daemon.pid)
+      end
+    end
+
+    # 🔴 **makoto2#162。**⚠⚠ **`alive?` が false と答えている相手に TERM を送っていた** —
+    # ⚠ **`run_restart` は `run_stop if alive?` なので守られていたが、
+    # `bin/hadlar_daemon.rb stop` を直に叩く経路が素通しだった。**
+    def test_run_stop_does_not_signal_a_reused_pid
+      with_daemon(command: ['sleep', '300']) do |daemon|
+        with_captured_kill do |sent|
+          assert_false(daemon.alive?)
+          # ⚠ `alive?` の在否確認（signal 0）は数えない。**見たいのは TERM だけ。**
+          sent.clear
+          daemon.send(:run_stop)
+
+          assert_equal([], sent)
+          assert_path_not_exist(daemon.pid_file)
+        end
+      end
+    end
+
+    # 🔴 **makoto2#169（Codex の P1）。**⚠⚠ **`/proc` が無い環境では身元を確かめられない** —
+    # ⚠ **`daemon_pid?` はそれを `true` に倒す**（`alive?` にとっては正しい）ので、
+    # 🔴 **止める側がそのまま使うと、素性の分からない pid へ TERM を送る。**
+    # ⚠ **pid ファイルは残す**（`EPERM` の枝と同じ。消すと孤児が確定する）。
+    def test_run_stop_refuses_when_proc_is_unavailable
+      with_daemon(proc_dir: '/nonexistent') do |daemon|
+        with_captured_kill do |sent|
+          assert_raise(SystemExit) {daemon.send(:run_stop)}
+          assert_equal([], sent)
+          assert_path_exist(daemon.pid_file)
+        end
+      end
+    end
+
+    # 🔴 **makoto2#169。**⚠ **読めない（`EACCES`）ときも同じ。**
+    def test_run_stop_refuses_when_the_argv_cannot_be_read
+      with_daemon(command: ['bin/hadlar_daemon.rb start']) do |daemon|
+        daemon.define_singleton_method(:argv) {|*| raise Errno::EACCES}
+        with_captured_kill do |sent|
+          assert_raise(SystemExit) {daemon.send(:run_stop)}
+          assert_equal([], sent)
+          assert_path_exist(daemon.pid_file)
+        end
+      end
+    end
+
+    # 🔴 **makoto2#169 の 2 巡目（Codex）。**⚠⚠ **`/proc` は読めるが `/proc/{pid}` の stat が
+    # 拒まれる形**（親に検索権が無い）。⚠ **`File.directory?` はこれを「無い」と
+    # 同じ false に畳む**ので、⚠⚠ **「確かめて、居ないと分かった」に化けて TERM が
+    # 飛んでいた。**🔴 **拒まれたなら送らず、pid ファイルも残す。**
+    def test_run_stop_refuses_when_the_proc_entry_cannot_be_stat
+      Dir.mktmpdir do |proc_dir|
+        entry = File.join(proc_dir, Process.pid.to_s)
+        FileUtils.mkdir_p(entry)
+        # ⚠ 検索権（`x`）だけを落とす → 親は読めるが子の stat が `EACCES`。
+        File.chmod(0o600, proc_dir)
+        begin
+          # ⚠⚠ **root で走らせると権限が効かない**（stat が通ってしまう）ので、
+          # **そのときは判定できない**。
+          omit('stat が拒まれない（root か)') unless stat_denied?(entry)
+          with_daemon(proc_dir: proc_dir) do |daemon|
+            with_captured_kill do |sent|
+              assert_raise(SystemExit) {daemon.send(:run_stop)}
+              assert_equal([], sent)
+              assert_path_exist(daemon.pid_file)
+            end
+          end
+        ensure
+          # ⚠ 戻さないと `Dir.mktmpdir` の後始末が失敗する。
+          File.chmod(0o700, proc_dir)
+        end
+      end
+    end
+
+    # ⚠⚠ **「もう居ない」は確かめられている**（`/proc/{pid}` が無い）ので、
+    # 🔴 **拒まずに掃除する。**⚠ **ここを拒むと `run_start` が「already running」で
+    # 無言終了する**（makoto2#80 の黄 6）。
+    def test_run_stop_still_cleans_up_when_the_process_is_gone_from_proc
+      # ⚠ `/proc` そのものは在り、その中に pid の項目だけが無い形を作る。
+      Dir.mktmpdir do |proc_dir|
+        with_daemon(proc_dir: proc_dir) do |daemon|
+          with_captured_kill(error: Errno::ESRCH) do
+            daemon.send(:run_stop)
+
+            assert_path_not_exist(daemon.pid_file)
+          end
+        end
+      end
+    end
+
+    # ⚠ 居ないなら掃除してよい。⚠⚠ **残すと `run_start` が「already running」で
+    # 無言終了する**（makoto2#80 の黄 6 で踏んだ形）。
+    def test_run_stop_removes_the_pid_file_when_the_process_is_gone
+      with_daemon(command: ['bin/hadlar_daemon.rb start']) do |daemon|
+        with_captured_kill(error: Errno::ESRCH) do
+          daemon.send(:run_stop)
+
+          assert_path_not_exist(daemon.pid_file)
+        end
+      end
+    end
+
+    # ⚠ 設定の検証を差し替える（`errors` は読み込んだファイルを見るので
+    # `config['/x'] = y` では変わらない → test/config.rb）。
+    def with_config_errors(found)
+      config.define_singleton_method(:errors) {found}
+      config.reload
+      recorder = []
+      @daemon.instance_variable_set(:@logger, Struct.new(:x) do
+        define_method(:error) {|payload| recorder.push(payload)}
+        define_method(:info) {|payload| payload}
+      end.new(nil))
+      yield
+      return recorder
+    ensure
+      config.singleton_class.remove_method(:errors)
+      config.reload
+    end
+
+    # 🔴 **makoto2#99。**⚠⚠ **通らなくても常駐は止めない**（2026-08-21・オーナー判断）。
+    # ⚠ **止めると systemd の `Restart=always` が 5 秒ごとに叩き直す形**になり、
+    # ⚠⚠ **11/4 当日に踏むと復旧の時間が要る。**代わりに `/healthz` を赤にする。
+    def test_a_broken_config_is_logged_but_does_not_stop_the_start
+      recorder = with_config_errors(['壊れています in schema abc']) do
+        assert_nothing_raised {@daemon.send(:validate_config)}
+      end
+
+      assert_equal(1, recorder.size)
+      assert_equal('invalid', recorder.first[:config])
+      assert_equal(1, recorder.first[:count])
+    end
+
+    # ⚠ 通っていれば何も言わない（**平常時にログを汚さない**）。
+    def test_a_valid_config_is_not_logged
+      recorder = with_config_errors([]) do
+        assert_empty(@daemon.send(:validate_config))
+      end
+
+      assert_empty(recorder)
+    end
+
+    # ⚠⚠ **検証そのものが落ちても常駐は上げる。**⚠ schema が読めないだけでボットが
+    # 動かなくなるほうが痛い（`record_start` と同じ扱い）。
+    def test_a_failed_validation_does_not_stop_the_start
+      config.define_singleton_method(:validation_errors) {raise 'boom'}
+      recorder = []
+      @daemon.instance_variable_set(:@logger, Struct.new(:x) do
+        define_method(:error) {|payload| recorder.push(payload)}
+      end.new(nil))
+
+      assert_nothing_raised {@daemon.send(:validate_config)}
+      assert_equal('unverified', recorder.first[:config])
+    ensure
+      config.singleton_class.remove_method(:validation_errors)
+    end
+
+    # 🔴 **痕跡が書けなくても常駐は止めない**（リリース前レビューの黄 1）。
+    # ⚠⚠ **`Scheduler` 側の `record_tick` / `touch` と同じ扱い**にする — ⚠ **素で呼ぶと
+    # `tmp/run` が書けないだけで `start` の rescue が再送出し、監視の口も投稿も
+    # 立ち上がらないまま systemd が 5 秒ごとに叩き直す。**
+    def test_a_broken_trace_does_not_stop_the_start
+      # ⚠ **元のメソッドを持って戻す**（`class << self` の中に居るので
+      # `remove_method` では復元ではなく削除になる → `test/scheduler.rb`）。
+      original = Heartbeat.method(:record_start)
+      Heartbeat.define_singleton_method(:record_start) {|**| raise 'boom'}
+
+      assert_nothing_raised {@daemon.send(:record_start)}
+    ensure
+      Heartbeat.define_singleton_method(:record_start, original)
+    end
+
+    # ログを数えるための受け皿。⚠ **水準ごとに分けて数える**（makoto2#106 は失効とそれ以外を
+    # 分けるのが要点なので、「何か出た」では足りない）。
+    Recorder = Struct.new(:records) do
+      [:info, :warn, :error].each do |severity|
+        define_method(severity) {|payload| records[severity].push(payload)}
+      end
+
+      def debug(*)
+      end
+    end
+
+    def records_of_verify
+      records = Hash.new {|hash, key| hash[key] = []}
+      @daemon.instance_variable_set(:@logger, Recorder.new(records))
+      @daemon.send(:verify_credentials).join
+      return records
+    end
+
+    # ⚠ **`return` に多行のチェインを繋がない**（4 スペースを要求される →
+    # ginseng-style の docs/ruby.md）。受け皿の変数に置く。
+    def stub_verify(status, body = {})
+      headers = {'Content-Type' => 'application/json'}
+      stub = stub_request(:get, "#{config['/mastodon/url']}/api/v1/accounts/verify_credentials")
+      return stub.to_return(status: status, body: body.to_json, headers: headers)
+    end
+
+    # 🔴 **トークンが生きているかを起き上がりで 1 回見る**（makoto2#106）。
+    # ⚠ **投稿はしない**ので、当日の並びには影響しない。
+    def test_the_token_is_verified_at_start
+      stub_verify(200, acct: 'test', statuses_count: 183)
+      records = records_of_verify
+
+      assert_equal(1, records[:info].size)
+      assert_equal('test', records[:info].first[:acct])
+      assert_empty(records[:error])
+    end
+
+    # 🔴 **失効はエラー。**⚠⚠ **これが無いと、気付くのが 11/3 になる。**
+    def test_a_dead_token_is_logged_as_an_error
+      stub_verify(401, error: 'The access token is invalid')
+      records = records_of_verify
+
+      assert_equal(1, records[:error].size)
+      assert_equal('token is not valid', records[:error].first[:message])
+      assert_empty(records[:warn])
+    end
+
+    # ⚠⚠ **「引けなかった」を「失効」に化けさせない**（→ makoto2#124 と同じ形）。
+    # ⚠ Mastodon 側の不調は警告どまり。
+    def test_an_unreachable_mastodon_is_only_a_warning
+      stub_verify(404)
+      records = records_of_verify
+
+      assert_equal(1, records[:warn].size)
+      assert_equal('could not verify the token', records[:warn].first[:message])
+      assert_empty(records[:error])
+    end
+
+    # ⚠ **失敗しても常駐は止めない**（痕跡が書けないときと同じ扱い）。
+    def test_a_failed_verification_does_not_raise
+      stub_verify(401)
+
+      assert_nothing_raised {@daemon.send(:verify_credentials).join}
+    end
+
+    # 🔴 **常駐は Sentry の `release` にリビジョンまで載せる**（makoto2#347）。⚠ **初期化していなければ何もしない。**
+    def test_the_sentry_release_carries_the_revision
+      assert_nothing_raised {@daemon.send(:tag_sentry_release)}
+      Sentry.init {|sentry| sentry.dsn = 'https://publickey@o1.ingest.sentry.io/456'}
+      @daemon.send(:tag_sentry_release)
+
+      assert_equal("#{Package.version}+#{Package.revision}", Sentry.configuration.release)
+    ensure
+      Sentry.close
+    end
+
+    def records_of_max_length(declared)
+      body = declared ? {configuration: {statuses: {max_characters: declared}}} : {}
+      stub_request(:get, "#{config['/mastodon/url']}/api/v1/instance")
+        .to_return(status: 200, body: body.to_json, headers: {'Content-Type' => 'application/json'})
+      records = Hash.new {|hash, key| hash[key] = []}
+      @daemon.instance_variable_set(:@logger, Recorder.new(records))
+      @daemon.send(:verify_max_length).join
+      return records
+    end
+
+    # 🔴 **投稿先の上限が設定より短ければエラー**（makoto2#351）。⚠ **長いぶんには情報どまり。**
+    def test_a_shorter_declared_limit_is_an_error
+      limit = config['/mastodon/max_length']
+
+      errors = records_of_max_length(limit - 1)[:error]
+
+      assert_equal(1, errors.size)
+      # 🔴 **`error` 欄を持つ**（makoto2#440）— ⚠⚠ **無いと `rehearsal report` の受け皿（`count_unclassified`）が捨てる。**
+      assert_include(errors.first[:error].to_s, (limit - 1).to_s)
+      assert_equal(limit + 1, records_of_max_length(limit + 1)[:info].first[:declared])
+    end
+
+    # ⚠ **聞けなくても常駐は止めない**（警告どまり）。
+    def test_an_unreadable_limit_is_only_a_warning
+      config['/http/retry/seconds'] = 0
+      stub_request(:get, "#{config['/mastodon/url']}/api/v1/instance").to_return(status: 503)
+      records = Hash.new {|hash, key| hash[key] = []}
+      @daemon.instance_variable_set(:@logger, Recorder.new(records))
+      @daemon.send(:verify_max_length).join
+
+      assert_equal('could not read the limit', records[:warn].first[:message])
+      assert_empty(records[:error])
+    end
+
+    def test_pid_file
+      assert_equal(File.join(Environment.dir, 'tmp/pids/HadlarDaemon.pid'), @daemon.pid_file)
+    end
+
+    # 起動時のバナーとログにバージョンが出ること。動いているコードが判別できないと
+    # デプロイ・検証で事故る。
+    def test_motd
+      assert_include(@daemon.motd, Package.version)
+      assert_include(@daemon.motd, Environment.type)
+    end
+
+    # ⚠ hadlar は自分から出す投稿を持たないので、登録は 0 本（makoto2 は予告・朝挨拶・曲紹介・ライブの 7 本）。
+    def test_register_jobs
+      Scheduler.instance.clear
+
+      with_migrated_connection {@daemon.register_jobs}
+
+      assert_equal(0, Scheduler.instance.send(:jobs))
+      assert_empty(Scheduler.instance.rejected)
+    ensure
+      Scheduler.instance.clear
+    end
+
+    # 🔴 **`rake config:lint` が作るのと同じ一覧**（makoto2#276）。⚠ **登録と本数が揃っていること。**
+    def test_jobs
+      names = with_migrated_connection {@daemon.jobs}.map(&:name)
+
+      assert_empty(names)
+    end
+
+    # ⚠ **`ConfigError` 以外はクラス名を添える**（`EISDIR` か `EACCES` かが文に残らない）。
+    def test_describe_rejection
+      assert_equal('song: broken', @daemon.describe_rejection(Ginseng::ConfigError.new('song: broken')))
+      assert_equal('Errno::EISDIR: Is a directory - x', @daemon.describe_rejection(Errno::EISDIR.new('x')))
+    end
+
+    # ⚠ **`config:lint` の行は名前で始める。名前で始まる文には二重に付けない**（makoto2#561・makoto2#580）。
+    def test_lint_rejection
+      assert_equal('song: broken', @daemon.lint_rejection('song', Ginseng::ConfigError.new('song: broken')))
+      scheduler = Ginseng::ConfigError.new('scheduler: song (12:00) must avoid the commentary window (x)')
+
+      assert_equal(scheduler.message, @daemon.lint_rejection('song', scheduler))
+      commentary = Ginseng::ConfigError.new('commentary: nichiasa: finish must be after start')
+
+      assert_equal(
+        'song: commentary: nichiasa: finish must be after start',
+        @daemon.lint_rejection('song', commentary),
+      )
+      # ⚠ 前方が一致するだけの別の名前（`live` と `live-open`）には付ける。
+      assert_equal(
+        'live: live-open: broken',
+        @daemon.lint_rejection('live', Ginseng::ConfigError.new('live-open: broken')),
+      )
+      assert_equal('song: Errno::EISDIR: Is a directory - x', @daemon.lint_rejection('song', Errno::EISDIR.new('x')))
+    end
+
+    # 🔴 **見送りの理由は `/healthz` の本文に出るので、ログと同じマスクを通す**（makoto2#423）。
+    def test_describe_rejection_masks_urls
+      error = RuntimeError.new('GET https://x.example/?access_token=SECRET')
+      description = @daemon.describe_rejection(error)
+
+      assert_not_include(description, 'SECRET')
+      assert_include(description, 'access_token=[FILTERED]')
+      config_error = Ginseng::ConfigError.new('song: https://x.example/?access_token=SECRET')
+
+      assert_not_include(@daemon.describe_rejection(config_error), 'SECRET')
+    end
+
+    # ⚠ 冪等キーの前半になる名前が衝突しないこと。⚠⚠ **同じ名前が 2 本あると、同じ
+    # 枠の時刻で同じキーになり、片方の投稿が Mastodon 側で畳まれて消える。**
+    def test_job_names_are_unique
+      Scheduler.instance.clear
+
+      with_migrated_connection {@daemon.register_jobs}
+      names = Scheduler.instance.instance_variable_get(:@jobs).map(&:name)
+
+      assert_equal(names.uniq, names)
+    ensure
+      Scheduler.instance.clear
+    end
+
+    # 🔴 **常駐の配線**（makoto2#638）: 返事をするときだけ追いつき、3 本のスレッドを名前で見張る。
+    def wire(daemon, responder)
+      listener = Struct.new(:catch_up, :thread) {def start = nil}.new
+      worker = Struct.new(:thread) {def start = nil}
+      follow = worker.new(Thread.new {nil}.tap {|t| t.name = 'hadlar-follow'}.tap(&:join))
+      listener.thread = Thread.new {nil}.tap {|t| t.name = 'hadlar-stream'}.tap(&:join)
+      daemon.define_singleton_method(:chat_responder) {responder}
+      daemon.define_singleton_method(:follow_sync) {follow}
+      daemon.define_singleton_method(:mention_listener) {listener}
+      daemon.send(:start_threads)
+      return listener
+    end
+
+    def test_threads_are_wired_with_a_responder
+      responder = Struct.new(:thread) {def start = nil}.new(Thread.new {nil}.tap {|t| t.name = 'hadlar-chat'}.tap(&:join))
+      listener = wire(@daemon, responder)
+
+      assert_kind_of(MentionCatchUp, listener.catch_up)
+      assert_equal(['hadlar-chat', 'hadlar-follow', 'hadlar-stream'], Scheduler.instance.dead_threads.sort)
+    ensure
+      Scheduler.instance.thread_watch = nil
+    end
+
+    def test_threads_are_wired_without_a_responder
+      listener = wire(@daemon, nil)
+
+      assert_nil(listener.catch_up)
+      assert_equal(['hadlar-follow', 'hadlar-stream'], Scheduler.instance.dead_threads.sort)
+    ensure
+      Scheduler.instance.thread_watch = nil
+    end
+  end
+end

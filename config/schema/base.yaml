@@ -1,0 +1,407 @@
+---
+# config 全体（application.yaml / local.yaml）のスキーマ。
+# Ginseng::Config#errors（`rake config:lint`）が使用する。
+$schema: http://json-schema.org/draft-06/schema#
+title: hadlar config
+type: object
+properties:
+  environment:
+    enum:
+      - development
+      - production
+  # ⚠ 外への HTTP（makoto2#80 の緑 3）。⚠⚠ **origin/main からの持ち越しで、設定に在るのに
+  # schema が知らなかった。**
+  #
+  # ⚠ **どれも運用上必須。**⚠⚠ **timeout が欠けると 1 本の投稿が最悪 92 秒 →
+  # 既定の 60 秒 × 再送で枠を跨ぐ**（makoto2#90 で塞いだところがそのまま戻る）。
+  # ⚠ **retry が欠けると `Ginseng::HTTP` が起動時に落ちる**（`retry_limit` を素で読む）。
+  http:
+    type: object
+    properties:
+      retry:
+        type: object
+        properties:
+          # ⚠ 再送の回数。⚠⚠ 0 でも意味を持つ（再送しない）ので minimum は 0。
+          limit:
+            type: integer
+            minimum: 0
+          # 再送までの待ち（秒）。
+          seconds:
+            type: number
+            minimum: 0
+          # 429 の待ちを受け入れる上限（秒）。⚠ 省くと ginseng-core の既定（60）。
+          max_seconds:
+            type: number
+            minimum: 0
+        required:
+          - limit
+          - seconds
+      timeout:
+        type: object
+        properties:
+          # ⚠⚠ これは wall-clock の上限ではない（Net::HTTP の 1 回の socket 操作ごと
+          # → makoto2#92）。⚠ 黙って止まっている相手には効く。
+          seconds:
+            type: number
+            exclusiveMinimum: 0
+        required:
+          - seconds
+    required:
+      - retry
+      - timeout
+  logger:
+    type: object
+    properties:
+      # ⚠ 出すログの水準（makoto2#80 の黄 9）。⚠⚠ 読めない値でも落ちず info へ倒すが、
+      # 綴りの誤りは rake config:lint で先に止める。
+      level:
+        type: string
+        enum:
+          - debug
+          - info
+          - warn
+          - error
+          - fatal
+      mask_fields:
+        type: array
+        items:
+          type: string
+    required:
+      - level
+      - mask_fields
+  mastodon:
+    type: object
+    properties:
+      url:
+        type: string
+        format: uri
+        pattern: '^https?://'
+      acct:
+        type: string
+      token:
+        type: string
+      # 🔴 モロヘイヤを経由するか（makoto2#124）。⚠⚠ true が「経由する」＝ X-Mulukhiya を
+      # 送らない（ヘッダを付けたほうが迂回する）。
+      # ⚠⚠ optional_config で既定値に逃がさない — 消しただけで経路が静かに
+      # 戻り、タグ付けが掛からなくなる（makoto2#77 の裏返し）。だから required に入れる。
+      mulukhiya:
+        type: boolean
+      # 🔴 投稿先の本文の上限（makoto2#282 → PostBudget）。
+      max_length:
+        type: integer
+        minimum: 1
+      # 🔴 モロヘイヤが足すタグのぶん（makoto2#282 → PostBudget）。
+      proxy_reserve:
+        type: integer
+        minimum: 0
+    # ⚠ `whoami` も `post` も、この 2 つが無ければ動かない。ここに書いておかないと
+    # `rake config:lint` は通り、投稿しようとした瞬間に初めて失敗する。
+    required:
+      - url
+      - token
+      - mulukhiya
+      # ⚠ 消すと原稿の取り込みが落ちる（makoto2#282 → PostBudget・Codex の P2）。
+      - max_length
+  # 監視の口（makoto2#84）。⚠⚠ 3 つとも required にする — optional_config で既定値に
+  # 逃がすと、⚠ 設定を消しただけで監視の口が静かに閉じる（makoto2#77 の裏返し。
+  # /scheduler/posting/failure_limit と同じ判断）。
+  monitor:
+    type: object
+    properties:
+      enabled:
+        type: boolean
+      # ⚠ 既定は 127.0.0.1。開けるのは箱ごとに local.yaml で行う明示的な一手。
+      bind:
+        type: string
+      port:
+        type: integer
+        minimum: 1
+        maximum: 65535
+    required:
+      - enabled
+      - bind
+      - port
+  package:
+    type: object
+    properties:
+      version:
+        type: string
+      url:
+        type: string
+        format: uri
+        pattern: '^https?://'
+    required:
+      - version
+  scheduler:
+    type: object
+    properties:
+      heartbeat:
+        type: object
+        properties:
+          interval:
+            type: string
+        required:
+          - interval
+      timezone:
+        type: string
+      # ⚠ 枠の頭を拾う間隔。欠けると PostingJob が作れず、投稿が 1 本も出ない。
+      tick:
+        type: string
+      # ⚠ 枠の頭を拾う幅（makoto2#90）。⚠⚠ optional_config で既定値に逃がさない —
+      # 消しただけで拾う幅が tick まで縮み、静かに余裕がゼロに戻る（makoto2#77 の裏返し）。
+      tolerance:
+        type: string
+      # ⚠ tick が回らなくなったことの検知（makoto2#80 の黄 7）。⚠⚠ optional_config で
+      # 既定値に逃がさない — 消しただけで「生きているが投稿していない」の検知が
+      # 静かに消える（makoto2#77 の裏返し）。
+      tick_stale:
+        type: string
+      # 投稿が続けて落ちたことの検知（makoto2#78）。
+      posting:
+        type: object
+        properties:
+          # ⚠ 何本続けて落ちたら警告にするか。⚠⚠ 欠けると hadlar status が
+          # ConfigError で落ちる。既定値に逃がさないのは makoto2#77 の裏返しで、
+          # 設定を消しただけで検知が静かに緩む形を作らないため。
+          failure_limit:
+            type: integer
+            minimum: 1
+          # ⚠ 落ちた記録の寿命（makoto2#86）。消すと「その枠が次に成功するまで永久」に戻る
+          # ので、optional_config で読む（→ Heartbeat.failure_stale）。
+          failure_stale:
+            type: string
+        required:
+          - failure_limit
+    # ⚠ timezone が欠けるとホストのローカルタイムに落ちる。ライブの開始時刻がずれても
+    # 「何も起きない」だけなので、設定の検証で止める。
+    required:
+      - heartbeat
+      - timezone
+      - tick
+      - tolerance
+      - tick_stale
+      - posting
+  sqlite3:
+    type: object
+    properties:
+      db:
+        type: string
+    required:
+      - db
+  # チャットのモデレーション（makoto2#510）。⚠⚠ 欠けたら止める — 既定値に逃がすと、消しただけで上限が外れる。
+  chat:
+    type: object
+    properties:
+      limit:
+        type: object
+        properties:
+          account:
+            type: object
+            properties:
+              hour:
+                type: integer
+                minimum: 1
+              day:
+                type: integer
+                minimum: 1
+            required:
+              - hour
+              - day
+          global:
+            type: object
+            properties:
+              day:
+                type: integer
+                minimum: 1
+            required:
+              - day
+        required:
+          - account
+          - global
+      followers:
+        type: object
+        properties:
+          refresh:
+            type: string
+        required:
+          - refresh
+      # フォローを返す・外す（makoto2#606）。
+      follow:
+        type: object
+        properties:
+          enabled:
+            type: boolean
+          unfollow_limit:
+            type: integer
+            minimum: 0
+        required:
+          - enabled
+          - unfollow_limit
+      penalty:
+        type: array
+        minItems: 1
+        items:
+          type: string
+      enabled:
+        type: boolean
+      owner:
+        type: string
+        minLength: 1
+      thread:
+        type: object
+        properties:
+          max_statuses:
+            type: integer
+            minimum: 0
+        required:
+          - max_statuses
+      grace:
+        type: object
+        properties:
+          window:
+            type: string
+        required:
+          - window
+      # 決まった文の置き場（→ `NoticeRepository`）。⚠ 無いファイルは空（黙る）。
+      notices:
+        type: object
+        properties:
+          path:
+            type: string
+        required:
+          - path
+      catch_up:
+        type: object
+        properties:
+          max_age:
+            type: string
+        required:
+          - max_age
+      # 返事を作る LLM（makoto2#18・→ `ChatModel`）。
+      model:
+        type: object
+        properties:
+          name:
+            type: string
+          effort:
+            type: string
+            enum:
+              - low
+              - medium
+              - high
+          max_tokens:
+            type: integer
+            minimum: 1
+          timeout:
+            type: string
+          max_retries:
+            type: integer
+            minimum: 0
+          cache_ttl:
+            type: string
+            enum:
+              - 5m
+              - 1h
+          price:
+            type: object
+            properties:
+              input:
+                type: number
+              output:
+                type: number
+              cache_read:
+                type: number
+              cache_write:
+                type: object
+                properties:
+                  5m:
+                    type: number
+                  1h:
+                    type: number
+                required:
+                  - 5m
+                  - 1h
+            required:
+              - input
+              - output
+              - cache_read
+              - cache_write
+        required:
+          - name
+          - effort
+          - max_tokens
+          - timeout
+          - max_retries
+          - cache_ttl
+          - price
+    required:
+      - limit
+      - followers
+      - penalty
+      - model
+      - enabled
+      - owner
+      - thread
+      - grace
+      - catch_up
+      - follow
+  # LLM の API キー（makoto2#18）。⚠ **秘密情報なので config/local.yaml にだけ書く。**⚠ **無ければチャットボットは
+  # 応答しない**（受信は続く → `ChatModel.enabled?`）ので必須にしない。
+  anthropic:
+    type: object
+    properties:
+      api_key:
+        type: string
+      workspace_id:
+        type: string
+  # メンションの受信（makoto2#29）。⚠⚠ 欠けたら止める — optional_config で既定値に逃がすと、
+  # 消しただけで受信の止まりの検知が静かに消える（makoto2#77 の裏返し）。
+  streaming:
+    type: object
+    properties:
+      enabled:
+        type: boolean
+      stale:
+        type: string
+      retry:
+        type: object
+        properties:
+          base:
+            type: string
+          max:
+            type: string
+        required:
+          - base
+          - max
+    required:
+      - enabled
+      - stale
+      - retry
+  # 例外の集約（makoto2#28）。⚠ dsn が null なら送らない。
+  sentry:
+    type: object
+    properties:
+      dsn:
+        type:
+          - string
+          - 'null'
+        # 🔴 **DSN の形（`https://<鍵>@<ホスト>/<プロジェクト>`）まで見る**（makoto2#347）。⚠⚠ **`^https://`
+        # だけだと、WebUI のプロジェクトの URL を貼っても通り、初期化に成功して 1 件も送らない。**
+        pattern: '^https://[^@/]+@[^/]+/.+'
+      traces_sample_rate:
+        type: number
+        minimum: 0
+        maximum: 1
+required:
+  - chat
+  - environment
+  # ⚠ 節ごと消えたときも止める（makoto2#80 の緑 3）。⚠⚠ 中の required だけでは、
+  # 節そのものが無い設定を通してしまう。
+  - http
+  - logger
+  - mastodon
+  - monitor
+  - package
+  - scheduler
+  - sqlite3
+  - streaming

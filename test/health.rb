@@ -1,0 +1,781 @@
+module Hadlar
+  class HealthTest < TestCase
+    setup do
+      FileUtils.rm_f(Heartbeat.path)
+      @proc_dir = File.join(Environment.dir, 'tmp/run/proc_test')
+      FileUtils.rm_rf(@proc_dir)
+      FileUtils.mkdir_p(@proc_dir)
+    end
+
+    teardown do
+      FileUtils.rm_f(Heartbeat.path)
+      FileUtils.rm_rf(@proc_dir)
+    end
+
+    # ⚠ **今の時刻から取る**（落ちた記録は `failure_stale` で今と比べて古くなる・v1.0.2 のリリース前レビューの赤）。
+    # ⚠⚠ 固定した日付だと、その日から 7 日たつとテストが落ちた。
+    def now
+      @now ||= Time.at(Time.now.to_i).getlocal('+09:00')
+      return @now
+    end
+
+    def daemon(alive: true, pid: 4649)
+      stub = HadlarDaemon.new
+      stub.define_singleton_method(:alive?) {alive}
+      stub.define_singleton_method(:pid) {pid}
+      return stub
+    end
+
+    def health(alive: true, pid: 4649)
+      return Health.new(daemon: daemon(alive: alive, pid: pid), now: now, proc_dir: @proc_dir)
+    end
+
+    # `/proc/{pid}/cmdline` は NUL 区切り。
+    #
+    # ⚠⚠ **配列を渡せば argv の区切りをそのまま書ける。**文字列を渡すと空白で割るが、
+    # ⚠ **実機の常駐は `bin/hadlar_daemon.rb start` が 1 要素**なので、その形を
+    # 表現できないと makoto2#61 の回帰テストが本物を模せない。
+    def fake_process(pid, command)
+      dir = File.join(@proc_dir, pid.to_s)
+      FileUtils.mkdir_p(dir)
+      argv = command.is_a?(Array) ? command : command.split
+      # ⚠ 実機は末尾に NUL の詰め物が付く。空要素を落とせているかもここで見る。
+      File.write(File.join(dir, 'cmdline'), "#{argv.join("\0")}\0\0\0")
+      return dir
+    end
+
+    def with_file_read_error(path, error)
+      read = File.method(:read)
+      File.define_singleton_method(:read) do |target, *args|
+        raise error if target == path
+        read.call(target, *args)
+      end
+      yield
+    ensure
+      File.define_singleton_method(:read, read)
+    end
+
+    def with_file_ownership(path, owned)
+      owned_method = File.method(:owned?)
+      File.define_singleton_method(:owned?) do |target|
+        target == path ? owned : owned_method.call(target)
+      end
+      yield
+    ensure
+      File.define_singleton_method(:owned?, owned_method)
+    end
+
+    # ⚠⚠ **健全な常駐は「ハートビート」と「tick」の両方の痕跡を残す**（makoto2#80 の黄 7）。
+    # ⚠ **ここで tick まで書くのは、健全の定義がそうなったから** — 片方だけの痕跡は
+    # まさに検知したい状態（tick 側だけが詰まった常駐）を指す。
+    def beat(jobs: 1, at: nil, tick: true)
+      Heartbeat.record_tick(now: at || now) if tick
+      return Heartbeat.touch(jobs: jobs, now: at || now)
+    end
+
+    # 🔴 **起動時に見送った投稿は赤**（makoto2#350）。⚠⚠ **常駐は起動を拒まない**ので、
+    # **ここが言わないと 1 本少ないまま健全になる。**
+    def test_a_rejected_job_is_an_error
+      Heartbeat.record_tick(now: now)
+      Heartbeat.touch(jobs: 6, rejected: {'song' => 'song: broken'}, now: now)
+      subject = health(pid: Process.pid)
+
+      assert_equal(Health::ERROR, subject.code)
+      assert_include(subject.errors, 'song is not registered: song: broken')
+    end
+
+    # ⚠ **別の常駐が書いた見送りは言わない**（→ `own_heartbeat?`）。
+    def test_a_rejected_job_of_another_process_is_ignored
+      Heartbeat.record_tick(now: now)
+      Heartbeat.touch(jobs: 6, rejected: {'song' => 'song: broken'}, now: now)
+
+      assert_equal([], health(pid: Process.pid + 1).rejected_errors)
+    end
+
+    # 🔴 **持ち主・本数・名前・リビジョンを 1 回の読みから出す**（makoto2#354・Codex の P2）。
+    def test_identity
+      Heartbeat.touch(jobs: 2, job_names: ['morning', 'song'], now: now)
+      own = health(pid: Process.pid).identity
+      foreign = health(pid: Process.pid + 1).identity
+
+      assert_equal([Process.pid, true, 2, ['morning', 'song']], [own.owner, own.own, own.jobs, own.job_names])
+      assert_equal([Process.pid, false, 2, nil, nil],
+        [foreign.owner, foreign.own, foreign.jobs, foreign.job_names, foreign.revision])
+    end
+
+    # 🔴 **常駐の Sentry が送れなければ警告**（makoto2#347・Codex の P2）。⚠⚠ **`errors`（復旧させる）には置かない。**
+    def test_a_misconfigured_sentry_is_a_warning
+      beat
+      Heartbeat.touch(jobs: 1, now: now)
+      Heartbeat.update {|record| record.merge(sentry: 'misconfigured')}
+      subject = health(pid: Process.pid)
+
+      assert_include(subject.warnings, 'sentry is misconfigured (a DSN is set but nothing will be sent)')
+      assert_empty(subject.errors)
+      assert_equal(Health::WARNING, subject.code)
+      assert_empty(health(pid: Process.pid + 1).sentry_warnings)
+    end
+
+    # 🔴 **メンションの受信が止まったら警告**（makoto2#29）。⚠⚠ **`errors` には置かない**（再起動で投稿を巻き込まない）。
+    def test_a_stale_stream_is_a_warning
+      config['/streaming/enabled'] = true
+      Heartbeat.record_start(now: now - (Heartbeat.stream_limit * 3))
+      Heartbeat.record_stream(now: now - (Heartbeat.stream_limit * 2))
+      beat
+      subject = health(pid: Process.pid)
+
+      assert_include(subject.warnings, "mention stream is stale (limit #{Heartbeat.stream_limit.round}s)")
+      assert_empty(subject.errors)
+      assert_equal(Health::WARNING, subject.code)
+    end
+
+    def test_a_fresh_stream_is_healthy
+      config['/streaming/enabled'] = true
+      Heartbeat.record_start(now: now - 3600)
+      Heartbeat.record_stream(now: now - 20)
+      beat
+
+      assert_empty(health(pid: Process.pid).stream_warnings)
+    end
+
+    # ⚠ **起き上がった直後は、前の稼働の古い受信時刻で鳴らない**（→ `Heartbeat.stream_stale?`）。
+    def test_a_fresh_start_covers_an_old_stream
+      config['/streaming/enabled'] = true
+      Heartbeat.record_stream(now: now - (Heartbeat.stream_limit * 10))
+      Heartbeat.record_start(now: now)
+      beat
+
+      assert_empty(health(pid: Process.pid).stream_warnings)
+    end
+
+    # ⚠ **受信を切っていれば言わない。**⚠ **別の常駐の痕跡でも言わない**（→ `own_heartbeat?`）。
+    def test_a_stream_warning_needs_the_listener_and_own_heartbeat
+      Heartbeat.record_stream(now: now - (Heartbeat.stream_limit * 10))
+      beat
+      config['/streaming/enabled'] = true
+
+      assert_empty(health(pid: Process.pid + 1).stream_warnings)
+      config['/streaming/enabled'] = false
+
+      assert_empty(health(pid: Process.pid).stream_warnings)
+    end
+
+    # 🔴 **キーが通らなくなったら言う**（makoto2#18）。⚠ 次に 1 回通れば消える。⚠ 返事を切っていれば言わない。
+    def test_a_rejected_chat_key_is_a_warning
+      config['/chat/enabled'] = true
+      config['/anthropic/api_key'] = 'sk-ant-test'
+      beat
+
+      assert_empty(health(pid: Process.pid).chat_warnings)
+      Heartbeat.record_chat_auth_failure(now: now)
+
+      assert_match(/\Achat API key was rejected at /, health(pid: Process.pid).chat_warnings.first)
+      Heartbeat.clear_chat_auth_failure
+
+      assert_empty(health(pid: Process.pid).chat_warnings)
+    end
+
+    def test_chat_without_a_key_is_a_warning
+      config['/chat/enabled'] = true
+      config['/anthropic/api_key'] = ''
+
+      assert_equal(['chat is enabled but there is no API key'], health(pid: Process.pid).chat_warnings)
+      config['/chat/enabled'] = false
+
+      assert_empty(health(pid: Process.pid).chat_warnings)
+    end
+
+    def test_healthy
+      beat
+
+      assert_equal(Health::OK, health.code)
+      assert_equal([], health.errors)
+      assert_equal([], health.warnings)
+    end
+
+    def test_not_running
+      beat
+
+      assert_equal(Health::ERROR, health(alive: false).code)
+      assert_true(health(alive: false).errors.any? {|m| m.include?('not running')})
+    end
+
+    # ⚠ hadlar は自分から出す投稿を持たないので、登録 0 本は異常ではない（makoto2 は異常だった・makoto2#15）。
+    def test_running_without_jobs
+      beat(jobs: 0)
+
+      assert_false(health.errors.any? {|m| m.include?('no posting job')})
+    end
+
+    # ⚠ ハートビートが止まれば、プロセスが生きていても異常。
+    def test_stale_heartbeat
+      config['/scheduler/heartbeat/interval'] = '1m'
+      beat(at: now - 300)
+
+      assert_equal(Health::ERROR, health.code)
+      assert_true(health.errors.any? {|m| m.include?('stale')})
+    end
+
+    # 🔴 **makoto2#80 の黄 7 の本体。**⚠⚠ **ハートビートは tick とは別の rufus ジョブ**なので、
+    # ⚠ **tick 側だけが詰まってもハートビートは動き続ける** — **「生きているが仕事を
+    # していない」を見るための痕跡が、まさにその状態で健全を返していた。**
+    def test_stale_tick_with_a_live_heartbeat
+      beat(tick: false)
+      Heartbeat.record_tick(now: now - (Heartbeat.tick_limit * 2))
+
+      assert_equal(Health::ERROR, health.code)
+      assert_true(health.errors.any? {|m| m.include?('tick is stale')})
+      # ⚠ ハートビートそのものは新しいままであること（＝旧実装が緑を返した状況）。
+      assert_not_include(health.errors, 'heartbeat is stale')
+    end
+
+    # ⚠ 猶予の内側なら鳴らない。⚠⚠ **1 回の tick は投稿の再送で 90 秒以上かかりうる**
+    # ので、tick の間隔（10 秒）を基準にすると誤報する。
+    def test_a_slow_tick_is_not_stale
+      beat(tick: false)
+      Heartbeat.record_tick(now: now - (Heartbeat.tick_limit - 1))
+
+      assert_equal(Health::OK, health.code)
+    end
+
+    # ⚠⚠ **痕跡が無いのは「一度も回っていない」。**⚠ 常駐は登録の直後に 1 回叩く
+    # （→ `Scheduler#schedule_posts`）ので、生きているのに無いのは異常。
+    def test_a_missing_tick_is_stale
+      beat(tick: false)
+
+      assert_true(health.errors.any? {|m| m.include?('tick is stale')})
+    end
+
+    # 🔴 **起き上がった直後は、初回 tick がまだ終わっていないだけ**（PR makoto2#98 の Codex
+    # 指摘）。⚠⚠ **監視の口は初回 tick より先に開く**ので、ここを異常と読むと
+    # **起動のたびに `/healthz` が赤くなる。**
+    def test_a_fresh_start_is_not_stale_before_the_first_tick
+      Heartbeat.record_start(now: now)
+      beat(tick: false)
+
+      assert_equal(Health::OK, health.code)
+    end
+
+    # ⚠⚠ **前回の稼働が残した古い痕跡でも同じ。**⚠ **落ちて猶予より長く空いてから
+    # 戻ってくる**のがまさにその形で、**戻った瞬間から赤い**のが元の挙動だった。
+    def test_a_restart_supersedes_an_old_tick
+      Heartbeat.record_tick(now: now - (Heartbeat.tick_limit * 10))
+      Heartbeat.record_start(now: now)
+      beat(tick: false)
+
+      assert_equal(Health::OK, health.code)
+    end
+
+    # ⚠ **猶予を過ぎれば検知は戻る。**⚠⚠ **起き上がったことを口実に黙り続けない** —
+    # 起きているのに tick が回らないのは makoto2#80 の黄 7 そのもの。
+    def test_a_start_stops_covering_after_the_grace_period
+      Heartbeat.record_start(now: now - (Heartbeat.tick_limit * 2))
+      beat(tick: false)
+
+      assert_true(health.errors.any? {|m| m.include?('tick is stale')})
+    end
+
+    # ⚠ 閾値は設定から出す（間隔を延ばした瞬間に誤検知しはじめるのを防ぐ）。
+    def test_tick_threshold_comes_from_the_setting
+      config['/scheduler/tick_stale'] = '1h'
+      beat(tick: false)
+      Heartbeat.record_tick(now: now - 600)
+
+      assert_equal(Health::OK, health.code)
+    end
+
+    # ⚠⚠ **既定値に逃がさない**（makoto2#77 の裏返し）。設定を消しただけで検知が静かに
+    # 消える形にしない。
+    def test_a_broken_tick_threshold_raises
+      config['/scheduler/tick_stale'] = 'いつか'
+      beat
+
+      assert_raise(Ginseng::ConfigError) {health.errors}
+    end
+
+    # ⚠ 痕跡が無ければ「ハートビートが止まっている」＋「tick が回っていない」の 2 つ。
+    def test_without_heartbeat
+      assert_equal(Health::ERROR, health.code)
+      assert_equal(2, health.errors.size)
+    end
+
+    def test_no_orphan
+      beat
+      fake_process(4649, 'ruby bin/hadlar_daemon.rb start')
+      fake_process(5000, 'nginx: worker process')
+
+      assert_equal([], health.orphans)
+      assert_equal(Health::OK, health.code)
+    end
+
+    # ⚠⚠ **pid ファイルに無い常駐は孤児。**旧実装が 11 日分撒いた件の再発検知。
+    def test_orphan_is_a_warning
+      beat
+      fake_process(4649, 'ruby bin/hadlar_daemon.rb start')
+      fake_process(4650, 'ruby bin/hadlar_daemon.rb start')
+
+      assert_equal([4650], health.orphans)
+      # ⚠ 警告であって異常ではない。再起動の瞬間に一時的に 2 本になりうるので、
+      # ここで復旧を叩かせるとループになる。
+      assert_equal(Health::WARNING, health.code)
+      assert_equal([], health.errors)
+    end
+
+    # ⚠ CLI 自身（`bin/hadlar status`）を孤児と数えない。
+    def test_cli_is_not_an_orphan
+      beat
+      fake_process(4650, 'ruby bin/hadlar status')
+
+      assert_equal([], health.orphans)
+    end
+
+    # ⚠⚠ **argv に文字列を含むだけの無関係なプロセスを孤児と報告しない**（makoto2#61）。
+    # ⚠ **踏みやすいのは運用側の経路** — 復旧のラッパースクリプト・デプロイのシェル・
+    # `pgrep` のワンライナー。**恒常的に踏むと本物の孤児が誤報に埋もれる。**
+    def test_unrelated_process_is_not_an_orphan
+      beat
+      fake_process(4650, 'sleep 60 hadlar_daemon_dummy')
+      fake_process(4651, ['bash', '-lc', 'bundle exec bin/hadlar_daemon.rb restart'])
+      fake_process(4652, ['/usr/local/bin/hadlar_daemon-restart'])
+      fake_process(4653, ['pgrep', '-af', 'hadlar_daemon'])
+
+      assert_equal([], health.orphans)
+      assert_equal(Health::OK, health.code)
+    end
+
+    # ⚠⚠ **これと上の 2 つが揃って初めて makoto2#61 の回帰テストになる。片方だけでは通る。**
+    #
+    # ⚠ **実機（bydo・2026-08-15 実測）の常駐は argv が 1 要素**で、
+    # `bin/hadlar_daemon.rb start` がまるごと入っている（bundler 経由の起動で `$0` が
+    # 書き換わるため）。**要素をそのまま突き合わせる実装だとここで取り逃がす。**
+    def test_real_daemon_argv_is_a_single_element
+      beat
+      fake_process(4650, ['bin/hadlar_daemon.rb start'])
+
+      assert_equal([4650], health.orphans)
+      assert_equal(Health::WARNING, health.code)
+    end
+
+    # ⚠ インタプリタ経由（`ruby bin/hadlar_daemon.rb start`）でも検知する。
+    def test_daemon_behind_an_interpreter_is_an_orphan
+      beat
+      fake_process(4650, '/home/deploy/.rbenv/versions/4.0.6/bin/ruby bin/hadlar_daemon.rb restart')
+
+      assert_equal([4650], health.orphans)
+    end
+
+    # 🔴 **makoto2#80 の緑 6。**⚠⚠ **編集・閲覧・grep はどれも「先頭 ＋ ファイルのパス」**
+    # なので、⚠ **2 つ目の要素を無条件にスクリプトとみなすと、開発中は恒常的に
+    # 誤報する**（実測で `vim app/lib/hadlar/daemon/hadlar_daemon.rb` が孤児になった）。
+    # ⚠⚠ **恒常的に踏むと、本物の孤児が誤報に埋もれる。**
+    def test_editing_the_daemon_source_is_not_an_orphan
+      beat
+      fake_process(4650, ['vim', 'app/lib/hadlar/daemon/hadlar_daemon.rb'])
+      fake_process(4651, ['less', 'bin/hadlar_daemon.rb'])
+      fake_process(4652, ['git', 'diff', 'app/lib/hadlar/daemon/hadlar_daemon.rb'])
+
+      assert_equal([], health.orphans)
+    end
+
+    # ⚠ **常駐にならないサブコマンドは孤児ではない**（makoto2#80 の緑 6）。
+    # ⚠⚠ **`status` は監視から繰り返し叩かれる**ので、数えると誤報の常連になる。
+    def test_a_transient_subcommand_is_not_an_orphan
+      beat
+      fake_process(4650, ['bin/hadlar_daemon.rb status'])
+      fake_process(4651, ['bin/hadlar_daemon.rb stop'])
+
+      assert_equal([], health.orphans)
+    end
+
+    # ⚠⚠ **`restart` は除かない。**⚠ **fork した子は argv を引き継ぐ**ので、
+    # **本物の常駐が `restart` のまま走っている**（実機の形）。
+    def test_a_daemon_started_by_restart_is_an_orphan
+      beat
+      fake_process(4650, ['bin/hadlar_daemon.rb restart'])
+
+      assert_equal([4650], health.orphans)
+    end
+
+    # ⚠ インタプリタ越しが 1 要素にまとまっている形でも検知する。
+    def test_a_daemon_behind_an_interpreter_in_one_element_is_an_orphan
+      beat
+      fake_process(4650, ['ruby bin/hadlar_daemon.rb start'])
+
+      assert_equal([4650], health.orphans)
+    end
+
+    # ⚠⚠ **インタプリタのオプションを読み飛ばす**（makoto2#68 のレビュー指摘）。
+    # ⚠ **スクリプトの位置を「インタプリタの次」と決め打つと、`--yjit` を付けた
+    # 起動を取り逃がす。**bydo の Ruby は YJIT 有効なので、実際に取りうる形。
+    def test_daemon_behind_interpreter_options_is_an_orphan
+      beat
+      fake_process(4650, 'ruby --yjit bin/hadlar_daemon.rb start')
+      fake_process(4651, ['ruby', '-W0', '-Ilib', '/srv/makoto2/bin/hadlar_daemon.rb', 'start'])
+
+      assert_equal([4650, 4651], health.orphans)
+    end
+
+    # ⚠⚠ **`/proc` が読めないときに「孤児は無い」と嘘をつかない。**守っているつもりで
+    # 無防備になるのを防ぐ。
+    def test_unreadable_proc_is_reported
+      beat
+      subject = Health.new(daemon: daemon, now: now, proc_dir: File.join(@proc_dir, 'missing'))
+
+      assert_nil(subject.orphans)
+      assert_equal(Health::WARNING, subject.code)
+      assert_true(subject.warnings.any? {|m| m.include?('/proc')})
+    end
+
+    # ⚠ 同じユーザーの関連プロセスが読めないなら、孤児の有無は確定できない。
+    # 「孤児なし」ではなく確認不能として警告する。
+    def test_permission_denied_proc_is_reported
+      beat
+      dir = fake_process(4650, 'ruby bin/hadlar_daemon.rb start')
+      subject = health
+
+      with_file_read_error(File.join(dir, 'cmdline'), Errno::EACCES) do
+        assert_equal(Health::WARNING, subject.code)
+        assert_nil(subject.orphans)
+        assert_equal(['cannot read /proc (orphan check skipped)'], subject.warnings)
+      end
+    end
+
+    # ⚠ 未分類の読み取りエラーも status を crash させず、確認不能に落とす。
+    def test_unexpected_proc_read_error_is_reported
+      beat
+      dir = fake_process(4650, 'ruby bin/hadlar_daemon.rb start')
+      subject = health
+
+      with_file_read_error(File.join(dir, 'cmdline'), Errno::EIO) do
+        assert_nil(subject.orphans)
+        assert_equal(['cannot read /proc (orphan check skipped)'], subject.warnings)
+        assert_equal(Health::WARNING, subject.code)
+      end
+    end
+
+    # ⚠ `hidepid=1` で読めない他ユーザーのプロセスは MAKOTO の孤児ではない。
+    # その存在だけで恒常的な警告にしない。
+    def test_unrelated_unreadable_process_does_not_warn
+      beat
+      dir = fake_process(9999, 'postgres: writer')
+      subject = health
+
+      with_file_ownership(dir, false) do
+        with_file_read_error(File.join(dir, 'cmdline'), Errno::EACCES) do
+          assert_equal([], subject.orphans)
+          assert_equal([], subject.warnings)
+          assert_equal(Health::OK, subject.code)
+        end
+      end
+    end
+
+    # ⚠ 読めた孤児は、他ユーザーのプロセスが読めなくても捨てない。
+    def test_readable_orphan_wins_over_unrelated_unreadable_process
+      beat
+      fake_process(4650, 'ruby bin/hadlar_daemon.rb start')
+      unrelated = fake_process(9999, 'postgres: writer')
+      subject = health
+
+      with_file_ownership(unrelated, false) do
+        with_file_read_error(File.join(unrelated, 'cmdline'), Errno::EACCES) do
+          assert_equal([4650], subject.orphans)
+          assert_equal(['orphan process: 4650'], subject.warnings)
+          assert_equal(Health::WARNING, subject.code)
+        end
+      end
+    end
+
+    # 🔴 **孤児が見つかっても、同じ利用者の項目が読めなかったことを捨てない**（makoto2#166）。
+    # ⚠⚠ **「孤児 1 件」に「実はもっとあるかもしれない」を添える。**⚠ **`orphans` は配列のまま。**
+    def test_an_orphan_and_an_unreadable_entry_are_both_reported
+      beat
+      fake_process(4650, 'ruby bin/hadlar_daemon.rb start')
+      unreadable = fake_process(4651, 'ruby bin/hadlar_daemon.rb start')
+      subject = health
+
+      with_file_read_error(File.join(unreadable, 'cmdline'), Errno::EACCES) do
+        assert_equal([4650], subject.orphans)
+        assert_equal(
+          ['orphan process: 4650', 'cannot read /proc (some entries skipped)'],
+          subject.warnings,
+        )
+        assert_equal(Health::WARNING, subject.code)
+      end
+    end
+
+    # ⚠ 列挙後に消えたプロセスは正常な競合。他の孤児の検出を止めない。
+    def test_disappeared_process_does_not_mask_other_orphan
+      beat
+      disappeared = fake_process(4650, 'ruby bin/hadlar_daemon.rb start')
+      fake_process(4651, 'ruby bin/hadlar_daemon.rb start')
+      FileUtils.rm_f(File.join(disappeared, 'cmdline'))
+
+      assert_equal([4651], health.orphans)
+      assert_equal(Health::WARNING, health.code)
+      assert_equal(['orphan process: 4651'], health.warnings)
+    end
+
+    def test_enoent_disappearance_is_clean_none
+      beat
+      disappeared = fake_process(4650, 'ruby bin/hadlar_daemon.rb start')
+      FileUtils.rm_f(File.join(disappeared, 'cmdline'))
+      subject = health
+
+      assert_equal([], subject.orphans)
+      assert_equal([], subject.warnings)
+      assert_equal(Health::OK, subject.code)
+    end
+
+    # ⚠ `cmdline` を open した後の消失は `ESRCH` になることもある。
+    def test_esrch_disappearance_does_not_mask_other_orphan
+      beat
+      disappeared = fake_process(4650, 'ruby bin/hadlar_daemon.rb start')
+      fake_process(4651, 'ruby bin/hadlar_daemon.rb start')
+      subject = health
+
+      with_file_read_error(File.join(disappeared, 'cmdline'), Errno::ESRCH) do
+        assert_equal([4651], subject.orphans)
+        assert_equal(['orphan process: 4651'], subject.warnings)
+        assert_equal(Health::WARNING, subject.code)
+      end
+    end
+
+    def test_esrch_disappearance_is_clean_none
+      beat
+      disappeared = fake_process(4650, 'ruby bin/hadlar_daemon.rb start')
+      subject = health
+
+      with_file_read_error(File.join(disappeared, 'cmdline'), Errno::ESRCH) do
+        assert_equal([], subject.orphans)
+        assert_equal([], subject.warnings)
+        assert_equal(Health::OK, subject.code)
+      end
+    end
+
+    # ⚠ 異常が警告より優先される（復旧が先）。
+    def test_error_wins_over_warning
+      beat(at: now - 86_400)
+      fake_process(4650, 'ruby bin/hadlar_daemon.rb start')
+
+      assert_equal(Health::ERROR, health.code)
+    end
+
+    # ⚠⚠ **ここから makoto2#78。**「登録は 5 本あるのに 1 本も出ない」を拾う。
+
+    # ⚠ **これが makoto2#78 の再現。**⚠⚠ **これまでは 160 枠が全滅しても 0（健全）だった。**
+    def test_consecutive_posting_failures_are_a_warning
+      config['/scheduler/posting/failure_limit'] = 3
+      beat
+      3.times {|i| Heartbeat.record_failure(post: 'announcement', slot: "announcement-#{i}", now: now)}
+
+      assert_equal(Health::WARNING, health.code)
+      # 🔴 **どの枠が落ちているかを出す**（makoto2#86）。⚠ **回数だけでは見に行く先が分からない。**
+      assert_true(health.warnings.any? {|m| m.include?('announcement x3')})
+      # ⚠⚠ **異常（1）にはしない。**再起動しても直らないので、検知 → 再起動 →
+      # また失敗のループになる（→ Health の冒頭）。
+      assert_equal([], health.errors)
+    end
+
+    # ⚠ **閾値の手前では鳴らさない。**Mastodon 側の一時的な失敗で毎回鳴らない。
+    def test_a_few_failures_are_not_a_warning
+      config['/scheduler/posting/failure_limit'] = 3
+      beat
+      2.times {Heartbeat.record_failure(now: now)}
+
+      assert_equal(Health::OK, health.code)
+    end
+
+    # ⚠⚠ **原稿が無いだけの日を警告にしない。**MAKOTO は 8/15〜10/31 の 2 か月半、
+    # **枠はあるのに 1 本も投稿しない**（本文の無い枠は数に入らない）。
+    def test_never_posted_is_not_a_warning
+      beat
+
+      assert_nil(health.posted_at)
+      assert_equal(0, health.posting_failures)
+      assert_equal(Health::OK, health.code)
+    end
+
+    # ⚠ **1 本出れば消える。**時間では薄れない（→ Health の冒頭）。
+    def test_a_success_clears_the_warning
+      config['/scheduler/posting/failure_limit'] = 3
+      beat
+      3.times {Heartbeat.record_failure(now: now)}
+
+      assert_equal(Health::WARNING, health.code)
+
+      Heartbeat.record_success(now: now)
+
+      assert_equal(Health::OK, health.code)
+      assert_equal(now, health.posted_at)
+    end
+
+    # ⚠ 死んでいるときは `errors` の側が言う。同じことを 2 度書かない。
+    def test_dead_daemon_does_not_add_the_posting_warning
+      config['/scheduler/posting/failure_limit'] = 1
+      beat
+      Heartbeat.record_failure(now: now)
+
+      assert_equal([], health(alive: false).warnings)
+    end
+
+    # ⚠ 孤児と重なったら両方出す（原因が別なので、片方に隠されると調べ損ねる）。
+    def test_posting_warning_and_orphan_are_both_reported
+      config['/scheduler/posting/failure_limit'] = 1
+      beat
+      Heartbeat.record_failure(now: now)
+      fake_process(4650, 'ruby bin/hadlar_daemon.rb start')
+
+      assert_equal(2, health.warnings.size)
+      assert_equal(Health::WARNING, health.code)
+    end
+
+    # ⚠ `errors` は読み込んだファイルを検証するので、⚠⚠ **`config['/x'] = y` では
+    # 変わらない**（→ test/config.rb）。**差し替えて見る。**
+    def with_config_errors(found)
+      config.define_singleton_method(:errors) {found}
+      config.reload
+      quiet_chat
+      return yield
+    ensure
+      config.singleton_class.remove_method(:errors)
+      config.reload
+    end
+
+    # 🔴 **makoto2#99 の本体。**⚠⚠ **`rake config:lint` は開発機で流すもの**で、⚠ **稼働ホスト
+    # にしか無い `config/local.yaml` は検証を一度も通っていなかった。**
+    #
+    # ⚠ **効くのは「起動はしたが、その設定を使う瞬間に落ちる」形** — ⚠⚠ **枠の中で
+    # 読む値が欠けていると `PostingJob` の rescue に飲まれ、「登録ジョブ 5 で健全」の
+    # まま 160 枠が沈黙する。**
+    def test_a_broken_config_is_an_error
+      beat
+
+      with_config_errors(['壊れています in schema abc']) do
+        assert_equal(1, health.errors.size)
+        assert_match(/\Aconfig is invalid \(1\): 壊れています\z/, health.errors.first)
+        assert_equal(Health::ERROR, health.code)
+      end
+    end
+
+    # ⚠ 通っていれば何も足さない（**平常時に赤くしない**）。
+    def test_a_valid_config_is_not_reported
+      beat
+
+      with_config_errors([]) do
+        assert_empty(health.errors)
+        assert_equal(Health::OK, health.code)
+      end
+    end
+
+    # ⚠⚠ **件数を出す。**⚠ 1 件目しか本文を載せないので、**まだあることが分かる形にする。**
+    def test_a_broken_config_reports_the_count
+      beat
+
+      with_config_errors(['1 つ目 in schema abc', '2 つ目 in schema abc']) do
+        assert_match(/\Aconfig is invalid \(2\): 1 つ目\z/, health.errors.first)
+      end
+    end
+
+    # 🔴 **LLM の API が続けて落ちたら言う**（makoto2#611）。⚠ 2 回までは言わない。⚠ 1 回通れば消える。
+    def test_repeated_chat_failures_are_a_warning
+      config['/chat/enabled'] = true
+      config['/anthropic/api_key'] = 'sk-ant-test'
+      beat
+      2.times {Heartbeat.record_chat_failure(now: now)}
+
+      assert_empty(health(pid: Process.pid).chat_warnings)
+      Heartbeat.record_chat_failure(now: now + 60)
+
+      assert_equal(["chat API failed 3 times in a row (since #{now.getlocal.iso8601})"],
+        health(pid: Process.pid).chat_warnings)
+      Heartbeat.clear_chat_failures
+
+      assert_empty(health(pid: Process.pid).chat_warnings)
+    end
+
+    # 🔴 **フォロワーの一覧が一度も引けていなければ言う**（makoto2#611）。⚠ その間、門は全員に黙る。
+    def test_unloaded_followers_are_a_warning
+      config['/chat/enabled'] = true
+      config['/anthropic/api_key'] = 'sk-ant-test'
+      beat
+      Heartbeat.record_followers_unloaded(now: now)
+      Heartbeat.record_followers_unloaded(now: now + 3600)
+
+      assert_equal(["followers have not been loaded since #{now.getlocal.iso8601}"],
+        health(pid: Process.pid).chat_warnings)
+      Heartbeat.clear_followers_unloaded
+
+      assert_empty(health(pid: Process.pid).chat_warnings)
+    end
+
+    # 🔴 **別スレッドが死んでいたら言う**（makoto2#611）。⚠ いまの常駐が書いたものだけ。⚠ 次の tick で書き直される。
+    def test_a_dead_thread_is_a_warning
+      Heartbeat.record_tick(now: now, dead_threads: ['hadlar-chat'])
+      Heartbeat.touch(jobs: 1, now: now)
+
+      assert_equal(['thread hadlar-chat is dead'], health(pid: Process.pid).thread_warnings)
+      assert_include(health(pid: Process.pid).warnings, 'thread hadlar-chat is dead')
+      assert_empty(health(pid: Process.pid + 1).thread_warnings)
+      Heartbeat.record_tick(now: now, dead_threads: [])
+
+      assert_empty(health(pid: Process.pid).thread_warnings)
+      Heartbeat.record_tick(now: now)
+
+      assert_empty(health(pid: Process.pid).thread_warnings)
+    end
+
+    # 🔴 **外すフォローが歯止めで止まっていたら言う**（makoto2#614）。
+    def test_a_held_unfollow_is_a_warning
+      config['/chat/follow/enabled'] = true
+      config['/streaming/enabled'] = true
+      beat
+      Heartbeat.record_follow_over_limit(25, 20, now: now)
+
+      assert_match("follow sync is holding 25 unfollows (over the limit 20) since #{now.getlocal.iso8601}",
+        health(pid: Process.pid).follow_warnings.first)
+      Heartbeat.clear_follow_over_limit
+
+      assert_empty(health(pid: Process.pid).follow_warnings)
+    end
+
+    # ⚠ 突き合わせを切ってあれば言わない（消す `sync` が走らない・v1.0.1 のリリース前レビュー）。
+    def test_a_held_unfollow_is_silent_when_follow_sync_is_off
+      config['/chat/follow/enabled'] = false
+      beat
+      Heartbeat.record_follow_over_limit(25, 20, now: now)
+
+      assert_empty(health(pid: Process.pid).follow_warnings)
+    end
+
+    # 🔴 **取りこぼしに追いつけていなければ言う**（makoto2#610・v1.0.1 のリリース前レビュー）。
+    def test_a_failing_catch_up_is_a_warning
+      config['/chat/enabled'] = true
+      config['/anthropic/api_key'] = 'sk-ant-test'
+      beat
+      Heartbeat.hold_notification_id(now: now)
+      Heartbeat.hold_notification_id(now: now + 600)
+
+      assert_equal(["mention catch-up has been failing since #{now.getlocal.iso8601}"],
+        health(pid: Process.pid).chat_warnings)
+      Heartbeat.release_notification_id
+
+      assert_empty(health(pid: Process.pid).chat_warnings)
+    end
+
+    # ⚠ 時刻として読めない値（前の実装の `true`）は、次に止めたときに時刻へ書き直す（PR makoto2#642 の Codex の P2）。
+    def test_a_legacy_catch_up_hold_is_normalized
+      Heartbeat.update {|record| record.merge(catch_up_pending: true)}
+      Heartbeat.hold_notification_id(now: now)
+
+      assert_equal(now.to_i, Heartbeat.catch_up_pending_since.to_i)
+    end
+
+    # ⚠ 前の常駐が書いた死んだスレッドは、起き上がったときに消す（v1.0.1 のリリース前レビュー）。
+    def test_dead_threads_are_cleared_on_start
+      Heartbeat.record_tick(now: now - 60, dead_threads: ['hadlar-chat'])
+      Heartbeat.record_start(now: now)
+
+      assert_empty(Heartbeat.dead_threads)
+    end
+  end
+end

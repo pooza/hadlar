@@ -1,0 +1,77 @@
+module Hadlar
+  # リハーサルが痕跡に残した未来の時刻を捨てる（makoto2#421）。🔴 **`Heartbeat.record_start` だけが呼ぶ。**
+  #
+  # ⚠⚠ **リハーサルは見かけの 11/4 で痕跡を書く**ので、**撤収して実時間で起き直すと
+  # `ticked_at` / `started_at` / `failed_at` が未来に残る。**⚠ **`Heartbeat` の `class << self`
+  # から `include` している**ので、`parse_time` はあちらのもの（→ `HeartbeatPosts` と同じ形）。
+  #
+  # ⚠ **切り出したのは `Metrics/ClassLength` に当たったから**だが、🔴 **境目は「痕跡を読み書きする
+  # 口」と「起き上がりのときの後始末」**で引いてある。
+  module HeartbeatFuture
+    # 起き上がりのときに、未来なら捨てる時刻。🔴 **`streamed_at` も含める**（makoto2#29・PR makoto2#586 の Codex の P2）—
+    # ⚠⚠ **リハーサル中に受けた見かけの時刻が残ると、撤収後に受信が止まっても警告が出ない**
+    # （`stream_stale?` は `started_at` との新しいほうを見る）。⚠ **騙している間も捨てる**（`ticked_at` と同じ・
+    # 起き直したら見かけの時刻が開始時刻へ戻るので、残すと見かけの時刻が追いつくまで鳴らない）。
+    FUTURE_STAMPS = [:started_at, :ticked_at, :streamed_at].freeze
+
+    # 🔴 **`time` より未来の時刻を痕跡から捨てる**（makoto2#421 → `record_start`）。
+    #
+    # ⚠ **`started_at` / `ticked_at` は消すだけ**（**`record_start` が猶予を張り直す**）。
+    # ⚠⚠ **枠の失敗は数ごと 0 に戻す**（→ `forget_future_failures`）— 🔴 **`failed_at` だけを
+    # 消すと「時刻が読めない記録は古くない扱い」で、かえって永久に鳴る。**
+    # ⚠ **枠の成功（`posted_at`）も捨てる**（makoto2#441 → `forget_future_successes`）。
+    #
+    # 🔴 **日付を騙している間は `started_at` / `ticked_at` だけ**（makoto2#421 の Codex の P1 ×2・makoto2#442）—
+    # ⚠⚠ **失敗と成功は同じリハーサルの証拠なので残す**（→ `record_start` の注記）。
+    def forget_future(record, time)
+      cleaned = record.reject do |key, value|
+        FUTURE_STAMPS.include?(key) && future?(value, time)
+      end
+      return forget_future_successes(forget_future_failures(cleaned, time), time)
+    end
+
+    def future?(value, time)
+      parsed = parse_time(value)
+      return !parsed.nil? && parsed > time
+    end
+
+    # 🔴 **未来の `failed_at` を持つ枠の失敗を捨てる**（makoto2#421 → `Heartbeat.record_start`）。
+    #
+    # ⚠⚠ **リハーサルの見かけの時刻で落ちた記録**なので、**実時間の常駐の健全さとは関係が無い。**
+    # ⚠ **全枠の `failed_at` は、残った枠のうちいちばん新しいものに引き直す**（**無ければ消す**）。
+    #
+    # 🔴 **割り切り: その枠がリハーサルの前から実時間で落ち続けていた本数も一緒に消える**（makoto2#446）。
+    # ⚠⚠ **`failures` は本数しか持たず、どの失敗が見かけの時刻のものかを分けられない。**⚠ **残すと
+    # 撤収後も赤が「見かけの `failed_at` ＋ `/heartbeat/failure_stale`」まで居座る**（makoto2#421・⚠ **期間は
+    # 定数ではなく、どの日付を騙したかで決まる** — 11/4 を騙せば実時間でその 1 週間後まで）ので、
+    # **消すほうを選んだ。**⚠ **本当に落ち続けている枠なら、実時間の失敗で数え直される** — 🔴 **ただし
+    # 0 から数え直すので、`/heartbeat/failure_limit` 本落ちるまで赤に戻らない。**⚠ **リハーサル中の
+    # 成功（`record_success`）も同じ本数を 0 に戻す**ので、この割り切りが無くても本数はそこで消えている
+    # （makoto2#462）。影響は日付を騙す `bydo` だけ（`rubicon` は騙さない）。
+    def forget_future_failures(record, time)
+      return forget_future_posts(record, time, :failed_at) do |value|
+        value.except(:failed_at).merge(failures: 0, slots: [])
+      end
+    end
+
+    # ⚠ **未来の `posted_at` を捨てる**（makoto2#441）。⚠⚠ **残すと `hadlar status` の "last success" と
+    # `/healthz/posting` の文面が見かけの 11/4 を言い続ける**（判定には使わないので表示だけ）。
+    def forget_future_successes(record, time)
+      return forget_future_posts(record, time, :posted_at) {|value| value.except(:posted_at)}
+    end
+
+    # ⚠ **枠ごとの `key` が未来なら `yield` で書き換え、全体の `key` を残った枠の最新に引き直す。**
+    def forget_future_posts(record, time, key)
+      posts = record[:posts].is_a?(Hash) ? record[:posts] : {}
+      kept = posts.to_h do |name, value|
+        next [name, value] unless value.is_a?(Hash) && future?(value[key], time)
+        [name, yield(value)]
+      end
+      cleaned = posts.empty? ? record : record.merge(posts: kept)
+      return cleaned unless future?(cleaned[key], time)
+      latest = kept.values.filter_map {|v| parse_time(v[key]) if v.is_a?(Hash)}.max
+      return cleaned.except(key) unless latest
+      return cleaned.merge(key => latest.getutc.iso8601)
+    end
+  end
+end

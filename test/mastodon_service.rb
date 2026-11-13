@@ -1,0 +1,745 @@
+module Hadlar
+  class MastodonServiceTest < TestCase
+    def setup
+      super
+      @service = MastodonService.new
+      @url = "#{config['/mastodon/url']}/api/v1/statuses"
+    end
+
+    # 返信の祖先（makoto2#18）。⚠ トークンを付けて直で聞く。
+    # makoto2#610 の追いつく口。⚠ メンションだけを古い順に。
+    def test_mentions_since
+      url = "#{config['/mastodon/url']}/api/v1/notifications?types%5B%5D=mention&since_id=10&limit=40"
+      body = [{id: '12', type: 'mention'}, {id: '11', type: 'mention'}, {id: '13', type: 'follow'}].to_json
+      stub_request(:get, url).to_return(status: 200, headers: {'Content-Type' => 'application/json'}, body: body)
+
+      assert_equal(['11', '12'], @service.mentions_since('10').map {|n| n['id']})
+    end
+
+    def test_status_ancestors
+      url = "#{config['/mastodon/url']}/api/v1/statuses/9/context"
+      body = {ancestors: [{id: '1'}, {id: '2'}], descendants: []}.to_json
+      stub_request(:get, url).to_return(status: 200, headers: {'Content-Type' => 'application/json'}, body: body)
+
+      assert_equal(['1', '2'], @service.status_ancestors('9').map {|status| status['id']})
+      assert_requested(:get, url, headers: {'X-Mulukhiya' => Package.full_name})
+    end
+
+    def test_status_ancestors_raises_on_a_bad_shape
+      url = "#{config['/mastodon/url']}/api/v1/statuses/9/context"
+      stub_request(:get, url).to_return(status: 200, headers: {'Content-Type' => 'application/json'}, body: '[]')
+
+      assert_raise(Ginseng::GatewayError) {@service.status_ancestors('9')}
+    end
+
+    # makoto2#20 の `hadlar chat block`。⚠ 見つからなければ nil（404 は例外にしない）。
+    def test_lookup_account
+      url = "#{config['/mastodon/url']}/api/v1/accounts/lookup?acct=user1"
+      stub_request(:get, url).to_return(status: 200, headers: {'Content-Type' => 'application/json'},
+        body: {id: '1', acct: 'user1'}.to_json)
+
+      assert_equal('1', @service.lookup_account('@user1')['id'])
+      stub_request(:get, "#{config['/mastodon/url']}/api/v1/accounts/lookup?acct=nobody").to_return(status: 404)
+
+      assert_nil(@service.lookup_account('nobody'))
+    end
+
+    # makoto2#636 の関係。⚠ `RELATIONSHIP_BATCH` 人ずつ聞き、重複は 1 回にする。
+    def test_relationships
+      ids = (1..(MastodonService::RELATIONSHIP_BATCH + 1)).map(&:to_s)
+      pattern = %r{/api/v1/accounts/relationships\?}
+      stub_request(:get, pattern).to_return do |request|
+        found = URI.decode_www_form(request.uri.query).map(&:last)
+        {status: 200, headers: {'Content-Type' => 'application/json'},
+         body: found.map {|id| {id:, following: false, requested: id == '1'}}.to_json}
+      end
+      found = @service.relationships(ids + ['1'])
+
+      # ⚠ WebMock はクエリを並べ替えるので、順は見ない。
+      assert_equal(ids.sort, found.map {|relationship| relationship['id']}.sort)
+      assert_true(found.find {|relationship| relationship['id'] == '1'}['requested'])
+      assert_requested(:get, pattern, times: 2)
+    end
+
+    def test_relationships_raises_on_a_bad_shape
+      stub_request(:get, %r{/api/v1/accounts/relationships\?})
+        .to_return(status: 200, headers: {'Content-Type' => 'application/json'}, body: '{}')
+
+      assert_raise(Ginseng::GatewayError) {@service.relationships(['1'])}
+    end
+
+    def test_post_status_in_reply_to
+      stub_request(:post, @url)
+        .to_return(status: 200, headers: {'Content-Type' => 'application/json'}, body: {
+          id: '2', url: "#{config['/mastodon/url']}/@test/2", visibility: 'unlisted'
+        }.to_json)
+      @service.post_status('@user1 はい', visibility: 'unlisted', in_reply_to_id: '9')
+
+      assert_requested(:post, @url) {|request| JSON.parse(request.body)['in_reply_to_id'] == '9'}
+    end
+
+    def test_post_status
+      stub_request(:post, @url)
+        .to_return(status: 200, headers: {'Content-Type' => 'application/json'}, body: {
+          id: '114514', url: "#{config['/mastodon/url']}/@test/114514", visibility: 'public'
+        }.to_json)
+      status = @service.post_status('こんにちは')
+
+      assert_equal('114514', status['id'])
+      assert_requested(:post, @url, times: 1)
+    end
+
+    # 🔴 **リダイレクトを追わない**（makoto2#282）。⚠⚠ **追うと POST が GET に化け、資格情報を含む
+    # ヘッダが別ホストへ送られる。**⚠ **3xx は「status ではない」として落ちる。**
+    #
+    # 🔴 **当てにしているのは上流の振る舞い**（`ginseng-fediverse` v2.0.1 以降・makoto2#349 で
+    # 暫定の上書きを畳んだ）。⚠⚠ **こちらに `post` は無いので、このテストが守るのは
+    # 「引いている gem がこの性質を持ち続けること」** — ⚠ **上流が `post` を組み替えて
+    # `follow_redirects` を落とせば、黙ってトークンが漏れるのではなく、ここが赤くなる**
+    # （makoto2#280 で採ったのと同じ置き方）。
+    def test_post_status_does_not_follow_a_redirect
+      elsewhere = 'https://elsewhere.example/api/v1/statuses'
+      stub_request(:post, @url).to_return(status: 302, headers: {'Location' => elsewhere})
+      stub_request(:any, elsewhere)
+
+      assert_raise(Ginseng::GatewayError) {@service.post_status('こんにちは')}
+      assert_requested(:post, @url, times: 1)
+      assert_not_requested(:any, elsewhere)
+    end
+
+    def test_post_status_sends_token
+      stub_request(:post, @url)
+        .with(headers: {'Authorization' => "Bearer #{config['/mastodon/token']}"})
+        .to_return(status: 200, headers: {'Content-Type' => 'application/json'}, body: status_body)
+      @service.post_status('こんにちは')
+
+      assert_requested(:post, @url, times: 1)
+    end
+
+    # 恒久的な失敗は分類して上げ、再送しない（ginseng-core 1.15.28 以降）。
+    # 無人で投稿し続けるボットが 401 を 3 回投げ直しても意味が無い。
+    def test_post_status_auth_error
+      stub_request(:post, @url).to_return(status: 401, body: '{}')
+
+      assert_raise(Ginseng::AuthError) {@service.post_status('こんにちは')}
+      assert_requested(:post, @url, times: 1)
+    end
+
+    def test_post_status_validate_error
+      stub_request(:post, @url).to_return(status: 422, body: '{}')
+
+      assert_raise(Ginseng::ValidateError) {@service.post_status('')}
+      assert_requested(:post, @url, times: 1)
+    end
+
+    # ⚠ 再送で投稿が二重に出ないこと。**同じキーが全試行で飛ぶ**のが本体で、
+    # 「キーが付いている」だけでは 3 通投稿される事故は防げない。
+    def test_post_status_reuses_idempotency_key_across_retries
+      config['/http/retry/seconds'] = 0
+      keys = []
+      stub_request(:post, @url).to_return do |request|
+        keys.push(request.headers['Idempotency-Key'])
+        {status: 503, body: '{}'}
+      end
+
+      assert_raise(Ginseng::GatewayError) {@service.post_status('こんにちは')}
+      assert_equal(config['/http/retry/limit'], keys.length)
+      assert_equal(1, keys.uniq.length)
+      assert_not_nil(keys.first)
+    end
+
+    # 投稿ごとには別のキーになる（同じキーを使い回すと 2 通目が捨てられる）。
+    def test_post_status_uses_fresh_idempotency_key_per_call
+      keys = []
+      stub_request(:post, @url).to_return do |request|
+        keys.push(request.headers['Idempotency-Key'])
+        {status: 200, headers: {'Content-Type' => 'application/json'}, body: status_body}
+      end
+      @service.post_status('こんにちは')
+      @service.post_status('こんばんは')
+
+      assert_equal(2, keys.uniq.length)
+    end
+
+    # 呼び出し側が「同じ予定の投稿」を識別できるなら、プロセスをまたいでも畳める。
+    def test_post_status_accepts_explicit_idempotency_key
+      stub_request(:post, @url)
+        .with(headers: {'Idempotency-Key' => 'morning-2026-11-01'})
+        .to_return(status: 200, headers: {'Content-Type' => 'application/json'}, body: status_body)
+      @service.post_status('おはよう', idempotency_key: 'morning-2026-11-01')
+
+      assert_requested(:post, @url, times: 1)
+    end
+
+    # 🔴 モロヘイヤを経由するとき、`X-Mulukhiya` を送らないこと（makoto2#124）。
+    # ⚠⚠ ヘッダを付けたほうが「経由しない」（nginx の map が Mastodon 本体へ直に
+    # 流す）。⚠ 送っていることに 3 週間気付かなかったので、正テストで固定する。
+    def test_post_status_omits_mulukhiya_header
+      headers = nil
+      stub_request(:post, @url).to_return do |request|
+        headers = request.headers
+        {status: 200, headers: {'Content-Type' => 'application/json'}, body: status_body}
+      end
+      MastodonService.new.post_status('こんにちは')
+
+      assert_nil(headers['X-Mulukhiya'])
+    end
+
+    # ⚠⚠ 迂回する側も見る。片方だけ通っていても気付けず、もう片方は設定次第で
+    # 本番でしか踏まない（→ makoto2#30 の tomato-shrieker の 2.5 か月）。
+    def test_post_status_sends_mulukhiya_header_when_disabled
+      config['/mastodon/mulukhiya'] = false
+      headers = nil
+      stub_request(:post, @url).to_return do |request|
+        headers = request.headers
+        {status: 200, headers: {'Content-Type' => 'application/json'}, body: status_body}
+      end
+      MastodonService.new.post_status('こんにちは')
+
+      assert_equal(Package.full_name, headers['X-Mulukhiya'])
+    end
+
+    # ⚠⚠ トークンの検査は経路の設定に関わらず常に直（makoto2#124）。⚠ 「モロヘイヤが
+    # 落ちている」が「トークンが死んでいる」に化けると、当日いちばん困る。
+    def test_account_always_bypasses_mulukhiya
+      url = "#{config['/mastodon/url']}/api/v1/accounts/verify_credentials"
+      headers = nil
+      stub_request(:get, url).to_return do |request|
+        headers = request.headers
+        {status: 200, headers: {'Content-Type' => 'application/json'}, body: status_body}
+      end
+      MastodonService.new.account
+
+      assert_equal(Package.full_name, headers['X-Mulukhiya'])
+    end
+
+    # 🔴 **別ホストへのリダイレクトでトークンを渡さない**（makoto2#349）。⚠⚠ **HTTParty が守るのは
+    # `basic_auth` / `digest_auth` だけ**なので、`headers` に置いた `Authorization` は
+    # 素のままだとホストが変わっても付いていく。
+    def test_account_rejects_a_redirect_to_another_host
+      url = "#{config['/mastodon/url']}/api/v1/accounts/verify_credentials"
+      elsewhere = 'https://elsewhere.example/api/v1/accounts/verify_credentials'
+      stub_request(:get, url).to_return(status: 302, headers: {'Location' => elsewhere})
+      stub_request(:any, elsewhere)
+
+      assert_raise(Ginseng::GatewayError) {MastodonService.new.account}
+      assert_requested(:get, url, times: 1)
+      assert_not_requested(:any, elsewhere)
+    end
+
+    # ⚠ **同じホストのリダイレクトは追える**（makoto2#349）。⚠⚠ **一律に `follow_redirects: false`
+    # にしないのはこのため** — **証明書切替やパスの整理で自分のホストが 301 を返す形は、
+    # トークンの漏れ方ではない。**
+    def test_account_follows_a_redirect_within_the_same_host
+      url = "#{config['/mastodon/url']}/api/v1/accounts/verify_credentials"
+      moved = "#{config['/mastodon/url']}/api/v2/accounts/verify_credentials"
+      stub_request(:get, url).to_return(status: 301, headers: {'Location' => moved})
+      stub_request(:get, moved)
+        .with(headers: {'Authorization' => "Bearer #{config['/mastodon/token']}"})
+        .to_return(status: 200, headers: {'Content-Type' => 'application/json'},
+          body: {acct: 'test', statuses_count: 1}.to_json)
+
+      assert_equal('test', MastodonService.new.account['acct'])
+      assert_requested(:get, moved, times: 1)
+    end
+
+    # ⚠⚠ 経路をログに残すこと（makoto2#124）。⚠ 経路の間違いは投稿の失敗として現れない
+    # ので、成功したログの側に出ていないと気付けない。
+    def test_post_status_logs_the_route
+      stub_request(:post, @url)
+        .to_return(status: 200, headers: {'Content-Type' => 'application/json'}, body: status_body)
+      messages = []
+      recorder = Object.new
+      recorder.define_singleton_method(:info) {|message| messages.push(message)}
+      service = MastodonService.new
+      service.define_singleton_method(:logger) {recorder}
+      service.post_status('こんにちは')
+
+      assert_true(messages.first[:mulukhiya])
+    end
+
+    # 🔴 **投稿先と同じ数え方の長さも出す**（makoto2#351）。
+    def test_post_status_logs_the_post_length
+      stub_request(:post, @url)
+        .to_return(status: 200, headers: {'Content-Type' => 'application/json'}, body: status_body)
+      messages = []
+      recorder = Object.new
+      recorder.define_singleton_method(:info) {|message| messages.push(message)}
+      service = MastodonService.new
+      service.define_singleton_method(:logger) {recorder}
+      service.post_status("あ https://example.com/#{'x' * 40}")
+
+      assert_equal(2 + 23, messages.first[:post_length])
+    end
+
+    # 🔴 **モロヘイヤが足した分を毎回残す**（makoto2#351）。
+    #
+    # ⚠⚠ **応答の `content` が「足された後の本文」**なので、**読み取り権は要らない** —
+    # ⚠ **`/api/v1/statuses/:id/source` は `read` が要るが、投稿の応答は `write` で返る。**
+    def test_post_status_logs_what_the_proxy_added
+      tag = '<p><a href="https://st2.precure.ml/tags/precure_fun" class="mention hashtag"' \
+        ' rel="tag">#<span>precure_fun</span></a></p>'
+      stub_request(:post, @url).to_return(
+        status: 200, headers: {'Content-Type' => 'application/json'},
+        body: status_body(content: "<p>こんにちは</p>#{tag}")
+      )
+      messages = []
+      recorder = Object.new
+      recorder.define_singleton_method(:info) {|message| messages.push(message)}
+      service = MastodonService.new
+      service.define_singleton_method(:logger) {recorder}
+      service.post_status('こんにちは')
+
+      # ⚠ 空行 2 字 ＋ `#precure_fun` 12 字
+      assert_equal(14, messages.first[:proxy_added])
+    end
+
+    # 🔴 **リモートのメンションはドメインを戻す**（makoto2#351・Codex の P2）。
+    #
+    # ⚠⚠ **Mastodon は `@alice@remote.example` を「見える文字は `@alice` だけ」で返す**ので、
+    # ⚠ **戻さないとドメインぶん（15 字）短く出て、足された分が負にもなりうる。**
+    def test_post_status_restores_the_domain_of_a_remote_mention
+      card = '<span class="h-card"><a href="https://remote.example/@alice"' \
+        ' class="u-url mention">@<span>alice</span></a></span>'
+      tag = '<p><a href="https://st2.precure.ml/tags/precure_fun" class="mention hashtag"' \
+        ' rel="tag">#<span>precure_fun</span></a></p>'
+      stub_request(:post, @url).to_return(
+        status: 200, headers: {'Content-Type' => 'application/json'},
+        body: status_body(
+          content: "<p>#{card} おはよう</p>#{tag}",
+          mentions: [{acct: 'alice@remote.example', username: 'alice'}],
+        )
+      )
+      messages = []
+      recorder = log_recorder(messages)
+      service = MastodonService.new
+      service.define_singleton_method(:logger) {recorder}
+      service.post_status('@alice@remote.example おはよう')
+
+      # ⚠ 空行 2 字 ＋ `#precure_fun` 12 字（🔴 **メンションのぶんは差に出ない**）
+      assert_equal(14, messages.first[:proxy_added])
+    end
+
+    # 🔴🔴 **負の値は記録しない**（makoto2#351）。⚠⚠ **モロヘイヤが字数を減らすことは無い**ので、
+    # **負なら応答から本文を戻しきれていない** — ⚠ **黙って混ぜると分布ごと信用できなくなる。**
+    def test_post_status_refuses_a_negative_proxy_added
+      stub_request(:post, @url).to_return(
+        status: 200, headers: {'Content-Type' => 'application/json'},
+        body: status_body(content: '<p>こん</p>')
+      )
+      messages = []
+      recorder = log_recorder(messages)
+      service = MastodonService.new
+      service.define_singleton_method(:logger) {recorder}
+      service.post_status('こんにちは')
+
+      assert_equal(['proxy_added is negative'], messages.filter_map {|m| m[:message]})
+      assert_nil(messages.find {|m| m[:status_id]}[:proxy_added])
+      # 🔴 **診断の行に `proxy_added` を出さない**（Codex の P2）— ⚠⚠ **出すと
+      # `RehearsalReport#count_post` が拾い、捨てた負の値が分布へ入る。**
+      warned = messages.find {|m| m[:message]}
+
+      assert_false(warned.key?(:proxy_added))
+      assert_equal(-3, warned[:rejected_length])
+    end
+
+    # 🔴 **予約を超えたら 1 行残す**（makoto2#351）。⚠⚠ **2026-09-24 に予約 100 が実測 159 に
+    # 負けていた**のに気付かなかったのは、**超えたことを言う口が無かったから。**
+    def test_post_status_warns_when_the_proxy_exceeds_the_reserve
+      tag = "<p>#{'あ' * 60}</p>"
+      stub_request(:post, @url).to_return(
+        status: 200, headers: {'Content-Type' => 'application/json'},
+        body: status_body(content: "<p>こんにちは</p>#{tag}")
+      )
+      messages = []
+      recorder = log_recorder(messages)
+      service = MastodonService.new
+      service.define_singleton_method(:logger) {recorder}
+      with_proxy_reserve(50) {service.post_status('こんにちは')}
+
+      warned = messages.find {|message| message[:message]}
+
+      assert_equal('proxy_added exceeds the reserve', warned[:message])
+      assert_equal(62, warned[:exceeded_length])
+      assert_equal(50, warned[:reserve])
+      # 🔴 **欄名を分ける**（⚠⚠ **`proxy_added` だと集計が拾って二重に入る**）。
+      assert_false(warned.key?(:proxy_added))
+      # ⚠ **投稿そのものは落とさない。**
+      assert_equal(62, messages.find {|message| message[:status_id]}[:proxy_added])
+    end
+
+    # ⚠ **予約の内側なら黙る。**
+    def test_post_status_is_quiet_within_the_reserve
+      stub_request(:post, @url).to_return(
+        status: 200, headers: {'Content-Type' => 'application/json'},
+        body: status_body(content: '<p>こんにちは</p><p>あああ</p>')
+      )
+      messages = []
+      recorder = log_recorder(messages)
+      service = MastodonService.new
+      service.define_singleton_method(:logger) {recorder}
+      with_proxy_reserve(50) {service.post_status('こんにちは')}
+
+      assert_nil(messages.find {|message| message[:message]})
+    end
+
+    # ⚠ **迂回しているときは測らない**（🔴 **モロヘイヤが何もしていない**）。
+    def test_post_status_does_not_measure_the_proxy_when_bypassing
+      stub_request(:post, @url).to_return(
+        status: 200, headers: {'Content-Type' => 'application/json'},
+        body: status_body(content: '<p>こんにちは</p>')
+      )
+      messages = []
+      recorder = Object.new
+      recorder.define_singleton_method(:info) {|message| messages.push(message)}
+      service = MastodonService.new
+      service.mulukhiya_enable = false
+      service.define_singleton_method(:logger) {recorder}
+      service.post_status('こんにちは')
+
+      assert_nil(messages.first[:proxy_added])
+    end
+
+    # 🔴 **記録の都合で「成功した投稿が失敗した」に化けさせない**（fail-open・makoto2#351）。
+    # ⚠⚠ **`content` を持たない 200 でも `post_status` は通る。**
+    def test_post_status_survives_a_response_without_content
+      stub_request(:post, @url)
+        .to_return(status: 200, headers: {'Content-Type' => 'application/json'}, body: status_body)
+      status = @service.post_status('こんにちは')
+
+      assert_equal('114514', status['id'])
+    end
+
+    def stub_instance(status, body)
+      url = "#{config['/mastodon/url']}/api/v1/instance"
+      headers = {'Content-Type' => 'application/json'}
+      return stub_request(:get, url).to_return(status: status, body: body.to_json, headers: headers)
+    end
+
+    # 🔴 **投稿先が申告する上限を読む**（makoto2#351）。⚠ **トークンは付けず、直で聞く。**
+    def test_declared_max_length
+      headers = nil
+      stub_request(:get, "#{config['/mastodon/url']}/api/v1/instance").to_return do |request|
+        headers = request.headers
+        {status: 200, headers: {'Content-Type' => 'application/json'},
+         body: {configuration: {statuses: {max_characters: 3000}}}.to_json}
+      end
+
+      assert_equal(3000, MastodonService.new.declared_max_length)
+      assert_equal(Package.full_name, headers['X-Mulukhiya'])
+      assert_false(headers.key?('Authorization'))
+    end
+
+    # ⚠ **書かれていなければ nil**（既定値に倒さない）。
+    def test_declared_max_length_without_the_field
+      stub_instance(200, {})
+
+      assert_nil(MastodonService.new.declared_max_length)
+    end
+
+    # ⚠⚠ **聞けなければ例外**（上流の `max_post_text_length` のように 500 に倒れない）。
+    def test_declared_max_length_raises_when_unreachable
+      config['/http/retry/seconds'] = 0
+      stub_instance(503, {})
+
+      assert_raise(Ginseng::GatewayError) {MastodonService.new.declared_max_length}
+    end
+
+    def stub_account(id = '7')
+      stub_request(:get, "#{config['/mastodon/url']}/api/v1/accounts/verify_credentials")
+        .to_return(status: 200, headers: {'Content-Type' => 'application/json'}, body: {id: id}.to_json)
+    end
+
+    # 🔴 **フォロワーの一覧は `Link` の `next` を辿って全部引く**（makoto2#510 の門）。
+    def test_follower_ids
+      stub_account
+      base = "#{config['/mastodon/url']}/api/v1/accounts/7/followers"
+      json = {'Content-Type' => 'application/json'}
+      stub_request(:get, "#{base}?limit=80").to_return(status: 200, body: [{id: '1'}, {id: '2'}].to_json,
+        headers: json.merge('Link' => "<#{base}?limit=80&max_id=2>; rel=\"next\", <#{base}?since_id=1>; rel=\"prev\""))
+      stub_request(:get, "#{base}?limit=80&max_id=2").to_return(status: 200, body: [{id: '3'}].to_json,
+        headers: json)
+
+      assert_equal(['1', '2', '3'], MastodonService.new.follower_ids)
+    end
+
+    # 🔴 **聞けなければ例外**（途中までの一覧を返さない）。⚠ **ページが尽きても例外。**
+    def test_follower_ids_raise_instead_of_returning_a_partial_list
+      config['/http/retry/seconds'] = 0
+      stub_account
+      base = "#{config['/mastodon/url']}/api/v1/accounts/7/followers"
+      stub_request(:get, "#{base}?limit=80").to_return(status: 200, body: [{id: '1'}].to_json,
+        headers: {'Content-Type' => 'application/json', 'Link' => "<#{base}?limit=80&max_id=1>; rel=\"next\""})
+      stub_request(:get, "#{base}?limit=80&max_id=1").to_return(status: 503, body: '{}')
+
+      assert_raise(Ginseng::GatewayError) {MastodonService.new.follower_ids}
+      assert_raise(Ginseng::GatewayError) {MastodonService.new.follower_ids(max_pages: 1)}
+    end
+
+    # ⚠ **別ホストの `next` は辿らない。**🔴 **途中までを全部として返さず、例外にする**（リリース前レビュー）。
+    def test_follower_ids_do_not_follow_another_host
+      stub_account
+      base = "#{config['/mastodon/url']}/api/v1/accounts/7/followers"
+      stub_request(:get, "#{base}?limit=80").to_return(status: 200, body: [{id: '1'}].to_json,
+        headers: {'Content-Type' => 'application/json',
+                  'Link' => '<https://evil.example.com/next>; rel="next"'})
+
+      assert_raise(Ginseng::GatewayError) {MastodonService.new.follower_ids}
+    end
+
+    # フォロー中の一覧も同じ引き方（makoto2#606）。
+    def test_following_ids
+      stub_account
+      base = "#{config['/mastodon/url']}/api/v1/accounts/7/following"
+      stub_request(:get, "#{base}?limit=80").to_return(status: 200, body: [{id: '5'}].to_json,
+        headers: {'Content-Type' => 'application/json'})
+
+      assert_equal(['5'], MastodonService.new.following_ids)
+    end
+
+    def test_follow_and_unfollow
+      base = "#{config['/mastodon/url']}/api/v1/accounts/9"
+      json = {'Content-Type' => 'application/json'}
+      stub_request(:post, "#{base}/follow").to_return(status: 200, headers: json,
+        body: {id: '9', following: false, requested: true}.to_json)
+      stub_request(:post, "#{base}/unfollow").to_return(status: 200, headers: json,
+        body: {id: '9', following: false}.to_json)
+      service = MastodonService.new
+
+      assert_true(service.follow('9')['requested'])
+      assert_false(service.unfollow('9')['following'])
+    end
+
+    def test_follow_raises_on_permanent_failure
+      stub_request(:post, "#{config['/mastodon/url']}/api/v1/accounts/9/follow").to_return(status: 403, body: '{}')
+
+      assert_raise(Ginseng::AuthError) {MastodonService.new.follow('9')}
+    end
+
+    # 🔴 **SSE の口は申告された `streaming_api` から組む**（makoto2#29）。⚠ `wss://` は `https://` へ。
+    # ⚠⚠ **トークンをクエリに載せない**（ヘッダで渡す）。
+    def test_streaming_uri
+      stub_instance(200, {urls: {streaming_api: 'wss://streaming.example.com'}})
+      service = MastodonService.new
+      uri = service.streaming_uri
+
+      assert_equal('https://streaming.example.com/api/v1/streaming/user/notification', uri.to_s)
+      assert_nil(uri.query)
+      assert_equal("Bearer #{service.token}", service.streaming_headers['Authorization'])
+      assert_equal('text/event-stream', service.streaming_headers['Accept'])
+      assert_equal(Package.full_name, service.streaming_headers['X-Mulukhiya'])
+    end
+
+    # ⚠ **申告が無ければ本体のホストに倒す。**
+    def test_streaming_uri_without_the_field
+      stub_instance(200, {})
+      uri = MastodonService.new.streaming_uri
+
+      assert_equal(URI.parse(config['/mastodon/url']).host, uri.host)
+      assert_equal(MastodonService::STREAMING_PATH, uri.path)
+    end
+
+    # ⚠ 「テストが本物のサーバーを叩かない」こと自体を見る。WebMock.enable! を忘れると
+    # stub も disable_net_connect! も無言で素通りし、実サーバーへ書き込む。
+    def test_net_connect_is_blocked
+      assert_raise(WebMock::NetConnectNotAllowedError) do
+        Net::HTTP.get(URI.parse('https://example.com/'))
+      end
+    end
+
+    # 一時的な失敗は再送する（再送そのものは ginseng-core の HTTP が持つ）。
+    def test_post_status_retries_server_error
+      config['/http/retry/seconds'] = 0
+      stub_request(:post, @url).to_return(status: 503, body: '{}')
+
+      assert_raise(Ginseng::GatewayError) {@service.post_status('こんにちは')}
+      assert_requested(:post, @url, times: config['/http/retry/limit'])
+    end
+
+    # ⚠ トークンが例外メッセージに載らないこと。ログにも出さない方針だが、
+    # 例外は rescue されずに上がると別経路で出力されうる。
+    def test_error_does_not_leak_token
+      stub_request(:post, @url).to_return(status: 401, body: '{}')
+      begin
+        @service.post_status('こんにちは')
+      rescue Ginseng::AuthError => e
+        assert_not_include(e.message, config['/mastodon/token'])
+        assert_not_include(e.backtrace.join("\n"), config['/mastodon/token'])
+      end
+    end
+
+    # ログのマスクが「実際に伏せる」ことを見る正テスト。
+    def test_logger_masks_token
+      message = Logger.new.create_message(mastodon: 'post', token: config['/mastodon/token'])
+
+      assert_not_include(message.keys, :token)
+      assert_not_include(message.to_json, config['/mastodon/token'])
+    end
+
+    # 🔴 **200 で HTML が返ったら失敗として上げること**（makoto2#272）。
+    #
+    # ⚠⚠ **httparty は対応していない Content-Type ではボディを String のまま返す。**
+    # ⚠ **`response['id']` は `String#[]('id')` になり、HTML に `id` の 2 文字があれば
+    # `"id"` を返す** — 🔴 **例外にならないので、`PostingJob` は成功として数え、
+    # `Heartbeat` の連敗を打ち消し、履歴まで進める**（投稿は 1 通も出ていないのに）。
+    def test_post_status_rejects_html_body
+      stub_request(:post, @url).to_return(
+        status: 200,
+        headers: {'Content-Type' => 'text/html'},
+        # ⚠ **`id` の 2 文字を含む HTML**（`<meta name=... id=...>` でまず含まれる）。
+        # ⚠⚠ **これを弾かないと `status_id` に `"id"` という 2 文字が載る。**
+        body: '<html><body id="maintenance">ただいまメンテナンス中です</body></html>',
+      )
+
+      assert_raise(Ginseng::GatewayError) {@service.post_status('こんにちは')}
+      # ⚠ **再送しない。**🔴 **200 が返っている以上 `HTTP#retryable?` は発火しない**ので、
+      # ⚠⚠ **1 回だけ叩いて諦めるのが正しい**（→ `PostingJob#post` のコメント）。
+      assert_requested(:post, @url, times: 1)
+    end
+
+    # ⚠⚠ **JSON でも status でなければ弾くこと**（makoto2#272）。
+    # 🔴 **`Hash` かどうかだけでは、200 で `{"status":"maintenance"}` を返す前段を通す。**
+    def test_post_status_rejects_json_without_id
+      stub_request(:post, @url).to_return(
+        status: 200,
+        headers: {'Content-Type' => 'application/json'},
+        body: {status: 'maintenance'}.to_json,
+      )
+
+      assert_raise(Ginseng::GatewayError) {@service.post_status('こんにちは')}
+    end
+
+    # ⚠ **弾いたことがログに残ること**（makoto2#272）。🔴 **型と経路を出す** — ⚠⚠ **誤ルーティング
+    # はモロヘイヤの側で起きる**ので、**経路が分からないと切り分けに 1 往復増える**（makoto2#124）。
+    def test_post_status_logs_the_unexpected_shape
+      stub_request(:post, @url)
+        .to_return(status: 200, headers: {'Content-Type' => 'text/html'}, body: '<html></html>')
+      messages = []
+      recorder = Object.new
+      recorder.define_singleton_method(:warn) {|message| messages.push(message)}
+      service = MastodonService.new
+      service.define_singleton_method(:logger) {recorder}
+      begin
+        service.post_status('こんにちは')
+      rescue Ginseng::GatewayError
+        nil
+      end
+
+      assert_equal(1, messages.length)
+      assert_equal('String', messages.first[:type])
+      assert_true(messages.first[:mulukhiya])
+    end
+
+    # ⚠⚠ **本文をログに載せないこと**（makoto2#272）。🔴 **HTML が丸ごとログに出ると、
+    # 前段が返したものを全部 syslog へ書くことになる** — ⚠ **型だけで区別は足りる。**
+    def test_post_status_does_not_log_the_unexpected_body
+      body = '<html><body>ただいまメンテナンス中です</body></html>'
+      stub_request(:post, @url)
+        .to_return(status: 200, headers: {'Content-Type' => 'text/html'}, body: body)
+      messages = []
+      recorder = Object.new
+      recorder.define_singleton_method(:warn) {|message| messages.push(message)}
+      service = MastodonService.new
+      service.define_singleton_method(:logger) {recorder}
+      begin
+        service.post_status('こんにちは')
+      rescue Ginseng::GatewayError
+        nil
+      end
+
+      assert_not_include(messages.first.to_json, 'メンテナンス')
+    end
+
+    # 🔴 **分類が化けないこと**（makoto2#272）。⚠⚠ **`GatewayError#source_status` は `message` の
+    # 末尾 3 桁を上流のステータスとして読む**ので、⚠ **例外メッセージの末尾に数字を
+    # 置くと `classify` が `PERMANENT_STATUSES` に当ててしまう**（400 なら `RequestError`）。
+    def test_post_status_unexpected_shape_is_not_classified_as_permanent
+      stub_request(:post, @url)
+        .to_return(status: 200, headers: {'Content-Type' => 'text/html'}, body: '<html></html>')
+      error = nil
+      begin
+        @service.post_status('こんにちは')
+      rescue Ginseng::GatewayError => e
+        error = e
+      end
+
+      assert_instance_of(Ginseng::GatewayError, error)
+      assert_equal(502, error.source_status)
+    end
+
+    # 🔴 **本文が読めないときも失敗として上げること**（makoto2#272・Codex の P2）。
+    #
+    # ⚠⚠ **`Content-Type` が `application/json` なら httparty は `JSON.parse` を通す**
+    # ので、**素のテキストは `JSON::ParserError`**（実測）。⚠ **`post_status` は
+    # `Ginseng::GatewayError` しか rescue しない**ので、🔴 **分類も警告も通らずに
+    # 外へ出ていた** — ⚠⚠ **`bin/hadlar post` の rescue も素通りする。**
+    def test_post_status_rejects_a_body_that_cannot_be_parsed
+      stub_request(:post, @url).to_return(
+        status: 200,
+        headers: {'Content-Type' => 'application/json'},
+        body: 'ただいまメンテナンス中です',
+      )
+
+      assert_raise(Ginseng::GatewayError) {@service.post_status('こんにちは')}
+    end
+
+    # ⚠ **何で落ちたのかがログに残ること**（makoto2#272）。🔴 **`String` ではなく
+    # `JSON::ParserError` と出る** — ⚠⚠ **「200 で HTML」と「200 で壊れた JSON」は
+    # 切り分け先が違う**（前者は vhost、後者は前段が本文を切っている）。
+    def test_post_status_logs_the_parse_failure
+      stub_request(:post, @url).to_return(
+        status: 200,
+        headers: {'Content-Type' => 'application/json'},
+        body: 'ただいまメンテナンス中です',
+      )
+      messages = []
+      recorder = Object.new
+      recorder.define_singleton_method(:warn) {|message| messages.push(message)}
+      service = MastodonService.new
+      service.define_singleton_method(:logger) {recorder}
+      begin
+        service.post_status('こんにちは')
+      rescue Ginseng::GatewayError
+        nil
+      end
+
+      assert_equal(['JSON::ParserError'], messages.map {|message| message[:type]})
+      assert_not_include(messages.first.to_json, 'メンテナンス')
+    end
+
+    private
+
+    # ⚠ **Mastodon が実際に返す形**（`POST /api/v1/statuses` は必ず `id` を持つ Status）。
+    # 🔴 **`'{}'` で書かない** — ⚠⚠ **起こりえない応答を前提にしたテストは、
+    # 応答の形を検査し始めた日に「壊れた」ように見える**（makoto2#272 で実際にそうなった）。
+    # @param content [String, nil] ⚠ **応答の本文（HTML）** — 🔴 **モロヘイヤが足した後の形**
+    # @param mentions [Array, nil] ⚠ **メンションの一覧**（🔴 **リモートはここからドメインを戻す**）
+    def status_body(content: nil, mentions: nil)
+      body = {
+        id: '114514',
+        url: "#{config['/mastodon/url']}/@test/114514",
+        visibility: 'public',
+      }
+      body[:content] = content if content
+      body[:mentions] = mentions if mentions
+      return body.to_json
+    end
+
+    # ⚠ **予約の値を差し替える**（🔴 **実測で引き直した日にテストの意味を変えないため**）。
+    def with_proxy_reserve(value)
+      original = config['/mastodon/proxy_reserve']
+      config['/mastodon/proxy_reserve'] = value
+      yield
+    ensure
+      config['/mastodon/proxy_reserve'] = original
+    end
+
+    # ⚠ **`info` と `warn` の両方を受ける**（🔴 **`proxy_added` は落ちたら `warn` を出す**）。
+    def log_recorder(messages)
+      recorder = Object.new
+      recorder.define_singleton_method(:info) {|message| messages.push(message)}
+      recorder.define_singleton_method(:warn) {|message| messages.push(message)}
+      return recorder
+    end
+  end
+end
