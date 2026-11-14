@@ -5,7 +5,7 @@
 #
 # 経路: pulls/N/reviews（本文）・pulls/N/comments（インライン）・issues/N/comments（要約）・issues/N/reactions（👍 / 👀）。
 # 🔴 片付いたかの判定はインラインごとの「返信 ＋ 👍」。PR への 👍 は「ある巡が指摘なしで終わった」印で、
-#    PR 全体が片付いた印ではない（→ .claude/skills/sync/SKILL.md の 4.）。
+#    PR 全体が片付いた印ではない（→ .claude/skills/sync/SKILL.md の 5.）。
 set -u -o pipefail
 bot='chatgpt-codex-connector[bot]'
 repo=$1
