@@ -199,7 +199,17 @@ module Hadlar
       end
       return if reasons.empty?
       penalty = gate.mark(account, reason: reasons.join(','), status_url: status['url'])
+      notify_owner_safely(account, status, penalty, reasons)
+    end
+
+    # 🔴 **オーナーへの知らせが落ちても、相手への返事は止めない**（PR #10 の Codex の P2）— 例外が
+    # `respond` まで上がると `post_reply` に届かず、通知は処理済みになるので、作れた返事が二度と出ない。
+    # ⚠ 印とペナルティは記録済み。知らせの失敗はログと Sentry に残す。
+    def notify_owner_safely(account, status, penalty, reasons)
       notify_owner(account, status, penalty, reasons)
+    rescue => e
+      logger.error(chat: 'owner', message: 'notice failed', status_id: status['id'], error: e)
+      report_error(e, chat: 'owner')
     end
 
     # ⚠ その種類の印が、猶予の期間の中で前にも付いていたか（今回のぶんを記録する前に見る）。
