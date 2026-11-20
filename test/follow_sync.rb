@@ -219,6 +219,23 @@ module Hadlar
       assert_include(@service.pending, '9')
     end
 
+    # 🔴 **外している最中にフォローし直した相手は外さない**（#19・makoto2#680）— 外す直前に 1 人ずつ確かめ直す。
+    # ⚠ `@roster.refresh` で一覧を先に読ませないと、`roster.ids` が nil のまま通ってしまう。
+    def test_a_follow_while_unfollowing_others_is_not_cancelled
+      follow_back!
+      @roster.refresh
+      sync = subject
+      service = @service
+      original = service.method(:unfollow)
+      service.define_singleton_method(:unfollow) do |id|
+        sync.on_follow({'id' => '8', 'acct' => 'back'}) if id == '7'
+        original.call(id)
+      end
+      sync.send(:apply, [], ['7', '8'])
+
+      assert_equal(['7'], @service.unfollowed)
+    end
+
     def test_follow_notification_reaches_the_follower
       follow_back!
       listener = MentionListener.new(service: Object.new, follower: subject)
