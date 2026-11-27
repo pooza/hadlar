@@ -25,7 +25,54 @@ module Hadlar
       fail_with("ホームを引けませんでした: #{error_message(e)}")
     end
 
+    # 🔴 **投稿しない。**見かけた投稿として LLM に渡し、絡む一言を表示するだけ（#37・指示書の手直し）。
+    # ⚠ **課金がある**（1 回 約 $0.003〜0.04）。⚠ 門（`TeaseGate`）も通らない（回数に数えない）。⚠ 常駐の痕跡に書かない（`quiet!`）。
+    desc 'try TEXT', '見かけた投稿として絡ませて表示する（投稿しない・課金あり）'
+    def try(text)
+      fail_with('API キーがありません（config/local.yaml の /anthropic/api_key）') unless ChatModel.enabled?
+      reply = model.tease(text)
+      fail_with('返事を作れませんでした（ログを見てください）') unless reply
+      puts reply.silent? ? '(絡まない)' : reply.text
+      puts usage_line(reply.usage)
+    end
+
+    # 🔴 **例題を全部流す**（#37）。⚠ **課金がある**（例題 1 件につき 1 回）。🔴 合格の線は「silent が全部空」。
+    desc 'eval', '例題を流して、絡まないはずの投稿に絡まないかを確かめる（投稿しない・課金あり）'
+    option :file, type: :string, default: 'config/chat/tease_examples.yaml', desc: '例題の YAML'
+    def eval
+      fail_with('API キーがありません（config/local.yaml の /anthropic/api_key）') unless ChatModel.enabled?
+      failed = YAML.load_file(File.expand_path(options[:file], Environment.dir)).count do |example|
+        !judge(example)
+      end
+      puts failed.zero? ? 'OK' : "NG: #{failed}"
+      exit 1 unless failed.zero?
+    end
+
     private
+
+    # @return [Boolean] 合格か
+    def judge(example)
+      reply = model.tease(example.fetch('text'))
+      unless reply
+        puts "ERROR #{example['text']}"
+        return false
+      end
+      ok = example['expect'] != 'silent' || reply.silent?
+      puts "#{ok ? 'ok' : 'NG'} [#{example['expect']}] #{example['text']}"
+      puts "    → #{reply.silent? ? '(絡まない)' : reply.text}"
+      return ok
+    end
+
+    def usage_line(usage)
+      return "tokens: #{usage[:input_tokens]} / #{usage[:output_tokens]}" \
+        " (cache read #{usage[:cache_read]} / write #{usage[:cache_write]}・約 $#{model.cost(usage)})"
+    end
+
+    # ⚠ **常駐の痕跡に書かない**（#28）。
+    def model
+      @model ||= ChatModel.new.quiet!
+      return @model
+    end
 
     def candidates
       @candidates ||= TeaseCandidates.new(

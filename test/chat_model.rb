@@ -86,6 +86,36 @@ module Hadlar
       end
     end
 
+    # 🔴 **自分から絡むときは、キャッシュの印より後ろに 3 つ目の塊を足す**（#37）。⚠⚠ **前の 2 塊・モデル・effort・出力の形は
+    # 返事と 1 バイトも変えない**（変えると返事とキャッシュを分け合えない）。🔴 **印は捨てる。**
+    def test_a_tease_adds_the_scene_after_the_cache_mark
+      stub_model(reply: '{"reply":"フン、散歩とは呑気なものよ。","marks":["provoke"]}')
+      reply = @model.tease('今日はいい天気だから散歩に行く')
+      normal = @model.params(MESSAGES)
+
+      assert_equal('フン、散歩とは呑気なものよ。', reply.text)
+      assert_empty(reply.marks)
+      assert_requested(:post, URL) do |request|
+        body = JSON.parse(request.body)
+
+        assert_equal(3, body['system'].size)
+        assert_equal(JSON.parse(normal[:system_].to_json), body['system'].first(2))
+        assert_equal(JSON.parse(normal[:output_config].to_json), body['output_config'])
+        assert_match(/話しかけられていない場面/, body['system'][2]['text'])
+        assert_nil(body['system'][2]['cache_control'])
+        assert_no_match(/<!--/, body['system'][2]['text'])
+        assert_equal([{'role' => 'user', 'content' => "〔フォロワーの投稿〕\n今日はいい天気だから散歩に行く"}],
+          body['messages'])
+        true
+      end
+    end
+
+    def test_a_failed_tease_is_nil
+      stub_request(:post, URL).to_return(status: 500, body: '{}', headers: {'Content-Type' => 'application/json'})
+
+      assert_nil(ChatModel.new.quiet!.tease('散歩に行く'))
+    end
+
     # ⚠ 空の返事は失敗ではない —「返事をしない」を選んだ（makoto2#510）。
     def test_an_empty_reply_is_silence_not_failure
       stub_model(reply: '{"reply":"","marks":["impersonate"]}')
