@@ -88,7 +88,7 @@ module Hadlar
     end
 
     # 痕跡の持ち主と、そこから読む身元（makoto2#354）。⚠ `own` が偽なら `job_names` / `revision` / `sentry` は nil。
-    Identity = Data.define(:owner, :own, :jobs, :job_names, :revision, :sentry)
+    Identity = Data.define(:owner, :own, :jobs, :job_names, :revision, :sentry, :tease)
 
     # 🔴 **痕跡を 1 回だけ読み、持ち主・本数・名前・リビジョンを同じ版から出す**（makoto2#354・Codex の P2）。
     # ⚠⚠ **痕跡は別のプロセスも書く**ので、**持ち主と名前を別々に読むと、間で持ち主が替わって
@@ -104,6 +104,7 @@ module Hadlar
         job_names: own ? record[:job_names] : nil,
         revision: own ? record[:revision] : nil,
         sentry: own ? record[:sentry] : nil,
+        tease: own ? record[:tease] : nil,
       )
     end
 

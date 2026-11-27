@@ -82,6 +82,8 @@ module Hadlar
 
       sentry — 🔴 常駐の例外の集約が送れる状態か（makoto2#347）。on / off (no DSN) / misconfigured
 
+      tease — 自分から絡む形（#38）。off / draft（オーナーへ下書きを DM）/ on
+
       ⚠⚠ 8/15〜10/31 は 1 本も投稿しないので posting は当てにならない。その間に
       「動いている」を確かめる手掛かりは tick（makoto2#150）。
     TEXT
@@ -100,7 +102,7 @@ module Hadlar
 
     private
 
-    # ⚠ **生きているときに出す 8 行**（→ `status` の `long_desc`）。⚠⚠ **死んでいれば
+    # ⚠ **生きているときに出す 9 行**（→ `status` の `long_desc`）。⚠⚠ **死んでいれば
     # `not running` の 1 行だけ**なので、ここは呼ばれない。
     def print_health(health)
       # ⚠ **痕跡は 1 回だけ読む**（→ `Health#identity`）。
@@ -113,6 +115,7 @@ module Hadlar
       puts "posting: #{format_posting(health)}"
       puts "orphans: #{health.orphans&.join(', ') || '(unknown)'}"
       puts "sentry: #{format_sentry(identity)}"
+      puts "tease: #{identity.own ? identity.tease || '(unknown)' : foreign_heartbeat(identity)}"
       return nil
     end
 

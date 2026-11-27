@@ -283,6 +283,8 @@ properties:
         properties:
           enabled:
             type: boolean
+          draft:
+            type: boolean
           interval:
             type: string
           chance:
@@ -332,6 +334,7 @@ properties:
               - max_length
         required:
           - enabled
+          - draft
           - interval
           - chance
           - limit

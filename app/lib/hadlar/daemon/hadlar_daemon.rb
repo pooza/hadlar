@@ -126,6 +126,7 @@ module Hadlar
       mention_listener.stop
       follow_sync.stop
       chat_responder&.stop
+      tease_worker.stop
       Scheduler.instance.shutdown
     end
 
@@ -136,8 +137,9 @@ module Hadlar
       # 🔴 **繋がったら取りこぼしに追いつく**（makoto2#610）。⚠ 返事をしないなら追いつかない。
       mention_listener.catch_up = chat_responder && MentionCatchUp.new(handler: chat_responder)
       mention_listener.start
-      # ⚠ 名前はスレッド自身の名前（`hadlar-chat` / `hadlar-follow` / `hadlar-stream`）。
-      workers = [chat_responder, follow_sync, mention_listener]
+      tease_worker.start # 🔴 自分から絡む（#38）。⚠ 閉じていれば起こさない（既定は閉じている）
+      # ⚠ 名前はスレッド自身の名前（`hadlar-chat` / `hadlar-follow` / `hadlar-stream` / `hadlar-tease`）。
+      workers = [chat_responder, follow_sync, mention_listener, tease_worker]
       Scheduler.instance.thread_watch = -> {workers.filter_map {|w| w&.thread}.index_by(&:name)}
     end
 
@@ -152,6 +154,8 @@ module Hadlar
     end
 
     # ⚠ **切ってあってもフォローの通知は受ける**（一覧に足す・makoto2#510）。スレッドは `start` が起こさない（makoto2#606）。
+    def tease_worker = (@tease_worker ||= TeaseWorker.new)
+
     def follow_sync
       @follow_sync ||= FollowSync.new
       return @follow_sync
