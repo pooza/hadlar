@@ -65,6 +65,18 @@ module Hadlar
       assert_equal(:stopped, @subject.reason(status))
     end
 
+    # 🔴 **既定の判定は block・ペナルティ・「絡むな」を見る**（#39）。
+    def test_the_default_stop_includes_opt_outs
+      repository = ChatRepository.new(empty_db)
+      subject = TeaseCandidates.new(own_id: '1', followed_by: ->(_id) {true}, clock: -> {NOW})
+      subject.instance_variable_set(:@repository, repository)
+
+      assert_nil(subject.reason(status))
+      repository.opt_out('10', 'alice')
+
+      assert_equal(:stopped, subject.reason(status))
+    end
+
     # 🔴 **`public` だけ** — フォロワー限定はホームに来ても、中身を別の集合へ出さない。
     def test_only_public_posts
       ['unlisted', 'private', 'direct'].each do |visibility|

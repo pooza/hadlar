@@ -96,6 +96,35 @@ module Hadlar
       return blocks.reverse(:blocked_at).all
     end
 
+    # 自分から絡まない相手（#39 → migration 005）。
+    def optouts
+      return @db[:tease_optout]
+    end
+
+    def opt_out(account_id, acct, at: Time.now)
+      key = account_id.to_s
+      return nil if opted_out(key)
+      return optouts.insert(account_id: key, acct: acct.to_s.delete_prefix('@'),
+        opted_out_at: local(at))
+    end
+
+    # 載っていれば行、無ければ nil。
+    def opted_out(account_id)
+      return optouts.where(account_id: account_id.to_s).first
+    end
+
+    def find_optout_by_acct(acct)
+      return optouts.where(acct: acct.to_s.delete_prefix('@')).first
+    end
+
+    def opt_in(account_id)
+      return optouts.where(account_id: account_id.to_s).delete
+    end
+
+    def all_optouts
+      return optouts.reverse(:opted_out_at).all
+    end
+
     def find_penalty_by_acct(acct)
       return penalties.where(acct: acct.to_s.delete_prefix('@')).first
     end

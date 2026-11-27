@@ -48,7 +48,41 @@ module Hadlar
       exit 1 unless failed.zero?
     end
 
+    # 🔴 **こちらから絡まない相手に載せる**（#39）。⚠ 本人が返事で頼めば自動で載る（印 `leave_alone`）。⚠ 返事は止めない。
+    desc 'off ACCT', 'こちらから絡まない相手に載せる（返事は続ける）'
+    def off(acct)
+      found = mastodon.lookup_account(acct)
+      fail_with("アカウントが見つかりません: #{acct}") unless found
+      fail_with("もう載っています: @#{found['acct']}") if repository.opted_out(found['id'])
+      repository.opt_out(found['id'], found['acct'])
+      puts "off: @#{found['acct']} (id: #{found['id']})"
+    end
+
+    # 🔴 **戻すのはオーナーの CLI だけ**（0.2・#25）。
+    desc 'on ACCT', 'こちらから絡まない相手から外す'
+    def on(acct)
+      # ⚠ 載せたときの acct で引けなければ、Mastodon で引き直して ID で探す（`chat unblock` と同じ）。
+      row = repository.find_optout_by_acct(acct)
+      row ||= (found = mastodon.lookup_account(acct)) && repository.opted_out(found['id'])
+      fail_with("載っていません: #{acct}") unless row
+      repository.opt_in(row[:account_id])
+      puts "on: @#{row[:acct]}"
+    end
+
+    desc 'list', 'こちらから絡まない相手の一覧'
+    def list
+      rows = repository.all_optouts
+      return puts('(none)') if rows.empty?
+      rows.each {|row| puts "@#{row[:acct]} since #{row[:opted_out_at]}"}
+    end
+
     private
+
+    # ⚠ テストが差し替える（`@repository`）。
+    def repository
+      @repository ||= ChatRepository.new
+      return @repository
+    end
 
     # @return [Boolean] 合格か
     def judge(example)
