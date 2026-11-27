@@ -277,6 +277,27 @@ properties:
             type: string
         required:
           - max_age
+      # 自分から絡む（#25・→ `TeaseCandidates`）。
+      tease:
+        type: object
+        properties:
+          candidate:
+            type: object
+            properties:
+              max_age:
+                type: string
+              min_length:
+                type: integer
+                minimum: 1
+              max_length:
+                type: integer
+                minimum: 1
+            required:
+              - max_age
+              - min_length
+              - max_length
+        required:
+          - candidate
       # 返事を作る LLM（makoto2#18・→ `ChatModel`）。
       model:
         type: object
