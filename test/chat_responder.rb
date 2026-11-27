@@ -264,6 +264,26 @@ module Hadlar
       assert_equal(['direct'], @service.posts.map {|post| post[:visibility]})
     end
 
+    # 🔴 **「絡むな」と頼まれたら載せ、返事は決まった文に差し替える**（#39）。⚠ ペナルティではない（返事は続ける）。
+    def test_leave_alone_opts_out_with_the_notice
+      script('tease_optout', 'ではこちらからは声をかけん。', 'tease-optout-1')
+      @model.reply = reply('分かった、もう絡まんぞ。', ['leave_alone'])
+
+      assert_equal(:tease_optout, responder.handle(notification))
+      assert_not_nil(@repository.opted_out('1'))
+      assert_nil(@repository.penalty('1'))
+      assert_equal(['@user1 ではこちらからは声をかけん。'], @service.posts.map {|post| post[:text]})
+    end
+
+    # ⚠ **原稿が無ければ黙る**（載せるのは止めない）。
+    def test_leave_alone_without_a_script_is_silent
+      @model.reply = reply('分かった、もう絡まんぞ。', ['leave_alone'])
+
+      assert_equal(:tease_optout, responder.handle(notification))
+      assert_not_nil(@repository.opted_out('1'))
+      assert_empty(@service.posts)
+    end
+
     # 🔴 **ペナルティ中は 1 回だけ伝えて、あとは黙る**（2026-11-09・オーナー）。⚠ LLM は呼ばない。
     def test_a_penalized_account_is_told_once
       script('chat_penalty_notice', 'しばらくお返事はお休みします。', 'chat-penalty-notice-1')

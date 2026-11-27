@@ -31,6 +31,7 @@ module Hadlar
   class ChatResponder
     include Package
     include ChatOwnerNotice
+    include ChatOptOut
 
     # ⚠ 溜まった通知の上限。⚠ 門の全体の上限（1 日 150 回）より十分小さければよい。
     QUEUE_MAX = 50
@@ -175,6 +176,7 @@ module Hadlar
       gate.record(account, decision)
       return done(:model_failed, notification) unless reply
       handle_marks(account, status, thread, reply.marks)
+      return opt_out(account, status, thread, notification) if reply.marks.include?('leave_alone')
       return done(:no_reply, notification, marks: reply.marks) if reply.silent?
       post_reply(account, status, reply.text, thread)
       return done(:respond, notification, marks: reply.marks)

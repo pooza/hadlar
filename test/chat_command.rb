@@ -51,6 +51,32 @@ module Hadlar
       $stderr = err
     end
 
+    def tease_command(repository: @repository)
+      subject = TeaseCommand.new
+      subject.instance_variable_set(:@repository, repository)
+      subject.instance_variable_set(:@mastodon, @mastodon)
+      return subject
+    end
+
+    # 🔴 **こちらから絡まない相手の出し入れ**（#39）。⚠ 戻すのはオーナーの CLI だけ。
+    def test_tease_off_on_and_list
+      out, _, exited = run_command {tease_command.off('cure_sword')}
+
+      assert_false(exited)
+      assert_match('off: @cure_sword (id: 7)', out)
+      assert_match('@cure_sword since', run_command {tease_command.list}.first)
+      assert_true(run_command {tease_command.off('cure_sword')}.last)
+
+      out, _, exited = run_command {tease_command.on('cure_sword@st2.precure.ml')}
+
+      assert_false(exited)
+      assert_match('on: @cure_sword', out)
+      assert_nil(@repository.opted_out('7'))
+      assert_equal("(none)\n", run_command {tease_command.list}.first)
+      assert_true(run_command {tease_command.on('cure_sword')}.last)
+      assert_true(run_command {tease_command.off('nobody')}.last)
+    end
+
     def test_block_and_list
       out, _, exited = run_command {command({note: 'しつこい'}).block('cure_sword')}
 

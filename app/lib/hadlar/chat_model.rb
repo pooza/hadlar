@@ -32,7 +32,7 @@ module Hadlar
     include Package
 
     # 悪戯の印（makoto2#510）。⚠ `config/chat/reply_format.md` の一覧と揃える。
-    MARKS = ['provoke', 'backstage', 'impersonate'].freeze
+    MARKS = ['provoke', 'backstage', 'impersonate', 'leave_alone'].freeze
 
     SCHEMA = {
       type: 'object',
