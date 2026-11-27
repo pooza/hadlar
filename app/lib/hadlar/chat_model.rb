@@ -55,7 +55,15 @@ module Hadlar
 
     # @param client [Anthropic::Client, nil] ⚠ テストが差し替える
     def initialize(client: nil)
+      @record = true
       @client = client
+    end
+
+    # 痕跡に書かない（`chat try` の CLI・makoto2#640 / makoto2#701）。⚠⚠ **常駐だけが書く**（キーの失効・
+    # 続けての失敗を、CLI が書いたり消したりしていた）。
+    def quiet!
+      @record = false
+      return self
     end
 
     # API キーが置いてあるか。⚠ **無ければチャットボットは動かない**（受信は続く）。
@@ -69,18 +77,18 @@ module Hadlar
     # @return [Reply, nil] ⚠ **失敗したら nil**（→ クラスの冒頭）
     def respond(messages)
       response = client.messages.create(**params(messages), request_options: request_options)
-      Heartbeat.clear_chat_failures
+      Heartbeat.clear_chat_failures if @record
       return parse(response)
     rescue Anthropic::Errors::AuthenticationError, Anthropic::Errors::PermissionDeniedError => e
       # 🔴 **キーの期限切れ・取り消し**（→ `HeartbeatChat`）。⚠ 再試行しても直らないので、痕跡に残して黙る。
-      Heartbeat.record_chat_auth_failure
+      Heartbeat.record_chat_auth_failure if @record
       logger.error(chat: 'model', message: 'api key is not valid', status: e.status,
         error_class: e.class.name)
       report_error(e, chat: 'model')
       return nil
     rescue Anthropic::Errors::APIError => e
       # 🔴 **続けて落ちていることを痕跡に残す**（makoto2#611 → `HeartbeatChat`）。
-      Heartbeat.record_chat_failure
+      Heartbeat.record_chat_failure if @record
       logger.error(chat: 'model', message: 'request failed', error_class: e.class.name,
         status: e.respond_to?(:status) ? e.status : nil, error: e)
       report_error(e, chat: 'model')
