@@ -207,6 +207,24 @@ module Hadlar
       raise classify(e)
     end
 
+    # ホームのタイムラインの新しい側（#35・自分から絡む候補 → `TeaseCandidates`）。⚠ **新しい順**のまま返す。
+    # ⚠ `read:statuses` が要る。⚠ 進行位置は持たない（毎回「新しい側 `limit` 件」を見るだけ・取りこぼしは無害）。
+    # ⚠ 経路の設定に関わらず直で聞く（→ `#account`）。
+    # @return [Array<Hash>]
+    def home_timeline(limit: 40)
+      query = URI.encode_www_form('limit' => limit)
+      response = http.get("/api/v1/timelines/home?#{query}", {
+        headers: direct_headers,
+        host_validator: ->(host) {host == http.base_uri.host},
+        follow_redirects: true,
+      })
+      body = response.parsed_response
+      raise_unexpected(body.class.name) unless body.is_a?(Array)
+      return body.grep(Hash)
+    rescue Ginseng::GatewayError => e
+      raise classify(e)
+    end
+
     # 返信の祖先（前のやりとり・makoto2#18）。⚠ **古い順。**⚠ **投稿しない**ので副作用は無い。
     #
     # 🔴 **`read:statuses` が要る**（2026-11-08 にトークンを作り直した）。⚠ トークンが無くても公開・未収載の
