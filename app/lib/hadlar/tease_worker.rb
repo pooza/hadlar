@@ -13,6 +13,8 @@ module Hadlar
     include Package
 
     FALLBACK_INTERVAL = 600
+    # ⚠ 覚えておく試した投稿の数（古いほうから忘れる）。⚠ 対象は書かれて 15 分以内なので、巡回 10 分なら数件で足りる。
+    SEEN_LIMIT = 1000
     DRAFT_HEADER = '〔絡みの下書き〕'.freeze
 
     # @param service [MastodonService, nil] ⚠ テストが差し替える
@@ -27,6 +29,7 @@ module Hadlar
       @model = model
       @sleeper = sleeper || ->(seconds) {sleep(seconds)}
       @stopping = false
+      @seen = []
     end
 
     def self.enabled?
@@ -74,7 +77,8 @@ module Hadlar
     def patrol(now = Time.now)
       closed = gate.closed_reason(now)
       return log(:closed, reason: closed) if closed
-      status = gate.pick(candidates.select(service.home_timeline), now)
+      fresh = candidates.select(service.home_timeline).reject {|s| @seen.include?(s['id'].to_s)}
+      status = gate.pick(fresh, now)
       return log(:none) unless status
       return tease(status, now)
     rescue => e
@@ -86,7 +90,11 @@ module Hadlar
     private
 
     # ⚠ **LLM を呼ぶ前に試行を数える**（落ちても費用はかかりうる・上限は試行で持つ）。
+    # 🔴 **同じ投稿に 2 度 LLM を呼ばない**（相手ごとの間隔が対象の古さより短い設定でも）。⚠ 覚えるのはプロセスの中だけ
+    # （再起動で忘れても、相手ごとの間隔と投稿の冪等キーが残る）。
     def tease(status, now)
+      @seen.push(status['id'].to_s)
+      @seen.shift while @seen.size > SEEN_LIMIT
       gate.record_try(status, now)
       reply = model.tease(ChatThread.text_of(status))
       return log(:failed, status_id: status['id']) unless reply

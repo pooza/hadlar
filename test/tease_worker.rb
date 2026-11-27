@@ -102,6 +102,16 @@ module Hadlar
       assert_empty(@gate.tries)
     end
 
+    # 🔴 **同じ投稿に 2 度 LLM を呼ばない**（相手ごとの間隔を詰めたステージングでも）。
+    def test_the_same_post_is_tried_once
+      @model.reply = reply('')
+      subject = worker
+
+      assert_equal(:silent, subject.patrol)
+      assert_equal(:none, subject.patrol)
+      assert_equal(['100'], @gate.tries)
+    end
+
     def test_a_failed_model_posts_nothing
       @model.reply = nil
 
