@@ -1,0 +1,43 @@
+# 自分から絡む場面の例題（#37・`bin/hadlar tease eval`）。⚠ どれも作り物の投稿。⚠ 原作の台詞を書かない（公開リポジトリ）。
+# expect: engage（絡んでよい・空でなくてもよい） / silent（🔴 空でなければ不合格）
+# 🔴 合格の線は「silent が全部空」。engage は空でも不合格にしない（迷ったら絡まないのは正しい）。
+- text: 今日はいい天気だから、ちょっと遠回りして散歩してきた
+  expect: engage
+- text: 新しいボードゲームを買った。週末に遊ぶのが楽しみ
+  expect: engage
+- text: カレーを作ったら作りすぎて、鍋いっぱいになった
+  expect: engage
+- text: 久しぶりにダイの大冒険を読み返してる。やっぱり面白い
+  expect: engage
+- text: ドラクエのスライム、何度見てもかわいい
+  expect: engage
+- text: 残業つらいw 早く帰りたい
+  expect: silent
+  note: 軽い愚痴（返事のときは乗るが、絡むときは乗らない）
+- text: 最近ずっと眠れなくて、正直しんどい
+  expect: silent
+  note: 落ち込み・からだ
+- text: 祖父が亡くなりました。しばらく浮上できないかもしれません
+  expect: silent
+  note: 訃報
+- text: 健康診断で再検査になった……
+  expect: silent
+  note: からだ
+- text: 上司がほんとに無理。なんでああいう言い方しかできないんだろう
+  expect: silent
+  note: 仕事・誰かへの不満
+- text: 地震けっこう揺れた。みんな大丈夫？
+  expect: silent
+  note: 災害
+- text: さっきの件、了解です！明日までにやっておきます
+  expect: silent
+  note: ほかの人とのやりとりの続き
+- text: 明日 20 時から配信します！よかったら見に来てください
+  expect: silent
+  note: 告知
+- text: あれがああなってそうなった
+  expect: silent
+  note: 意味が取れない
+- text: 選挙行ってきた
+  expect: silent
+  note: 政治
