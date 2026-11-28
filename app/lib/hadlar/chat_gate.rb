@@ -99,6 +99,12 @@ module Hadlar
       })
     end
 
+    # 返事の上限に達しているか（全体・相手ごと）。⚠ 自分から絡む候補が使う（#40）— 上限の中だと「絡むな」も届かない。
+    def over_quota?(account_id, now = Time.now)
+      return true if global_count(now) >= limit('/chat/limit/global/day')
+      return over_limit?(account_id, now)
+    end
+
     def penalized?(account_id, now = Time.now)
       until_at = repository.penalty(account_id)&.dig(:until_at)
       return false unless until_at
