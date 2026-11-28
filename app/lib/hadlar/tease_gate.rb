@@ -41,7 +41,9 @@ module Hadlar
     # 候補（`TeaseCandidates` を通ったもの）から 1 件を選ぶ。⚠ **外れたら nil**（抽選・相手ごとの間隔）。
     # @param statuses [Array<Hash>]
     # @return [Hash, nil]
+    # 🔴 **一度試した投稿は選ばない**（再起動しても・相手ごとの間隔が対象の古さより短い設定でも）。
     def pick(statuses, now = Time.now)
+      statuses = statuses.reject {|status| repository.recorded_status?(TRY, status['id'])}
       return nil if statuses.empty?
       return nil unless @random.rand < chance
       by_account = statuses.group_by {|status| status.dig('account', 'id').to_s}
@@ -76,7 +78,8 @@ module Hadlar
 
     def record(status, kind, now)
       account = status['account'] || {}
-      repository.record(account['id'], account['acct'], kind, now)
+      status_id = status['id'] if kind == TRY
+      repository.record(account['id'], account['acct'], kind, now, status_id: status_id)
     end
 
     def chance
