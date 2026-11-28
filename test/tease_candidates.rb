@@ -14,6 +14,7 @@ module Hadlar
         followed_by: followed_by || ->(id) {@followers.include?(id)},
         stopped: ->(id) {@stopped.include?(id)},
         clock: -> {NOW},
+        ignore_tags: ['Default'],
       )
     end
 
@@ -95,11 +96,17 @@ module Hadlar
         poll: [{poll: {'id' => '1'}}],
         quote: [{quote: {'id' => '1'}}],
         mention: [{mentions: [{'id' => '11'}]}],
-        tag: [{tags: [{'name' => 'delmulin'}]}],
+        tag: [{tags: [{'name' => 'jikkyo'}]}, {tags: [{'name' => 'default'}, {'name' => 'jikkyo'}]}],
         url: [{card: {'url' => 'https://example.com'}}, {content: '<p>見てこれ https://example.com/a すごい</p>'}],
       }.each do |reason, cases|
         cases.each {|fields| assert_equal(reason, @subject.reason(status(**fields)), fields.inspect)}
       end
+    end
+
+    # 🔴 **サーバーが毎回付ける既定のタグは数えない**（オーナー 2026-11-28）。⚠ 数えると公開の投稿がすべて落ちる。
+    def test_default_tags_are_ignored
+      assert_nil(@subject.reason(status(tags: [{'name' => 'default'}])))
+      assert_nil(@subject.reason(status(tags: [{'name' => 'DEFAULT'}])))
     end
 
     def test_length_and_age

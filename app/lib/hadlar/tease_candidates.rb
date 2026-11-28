@@ -29,11 +29,13 @@ module Hadlar
     # @param followed_by [#call, nil] ID → フォロワーか（⚠ 引けなければ例外）。⚠ テストが差し替える
     # @param stopped [#call, nil] ID → 返事を止めている相手か。⚠ テストが差し替える
     # @param clock [#call, nil] ⚠ テストが差し替える
-    def initialize(own_id:, followed_by: nil, stopped: nil, clock: nil)
+    # @param ignore_tags [Array<String>, nil] 数えないタグ（⚠ 大文字小文字を区別しない）。⚠ テストが差し替える
+    def initialize(own_id:, followed_by: nil, stopped: nil, clock: nil, ignore_tags: nil)
       @own_id = own_id.to_s
       @followed_by = followed_by || ->(id) {FollowerRoster.instance.include?(id)}
       @stopped = stopped || ->(id) {default_stopped?(id)}
       @clock = clock || -> {Time.now}
+      @ignore_tags = Array(ignore_tags || setting('ignore_tags')).map {|tag| tag.to_s.downcase}
     end
 
     # @param statuses [Array<Hash>] ホームの投稿（Mastodon の status）
@@ -76,8 +78,12 @@ module Hadlar
       return :poll if status['poll']
       return :quote if status['quote']
       return :mention if Array(status['mentions']).any?
-      return :tag if Array(status['tags']).any?
+      return :tag if counted_tags(status).any?
       return nil
+    end
+
+    def counted_tags(status)
+      return Array(status['tags']).map {|tag| tag['name'].to_s.downcase} - @ignore_tags
     end
 
     def text_reason(status)
