@@ -137,12 +137,14 @@ module Hadlar
       raise Ginseng::ConfigError, "tease: bad candidate max_age '#{value}'"
     end
 
-    # ⚠ `FollowSync#stopped?` の判定に、「絡むな」（#39）を足したもの。
+    # ⚠ `FollowSync#stopped?` の判定に、「絡むな」（#39）と返事の上限を足したもの。
+    # 🔴 **返事の上限に達している相手には絡まない** — 返事が LLM に届かないので「絡むな」と頼めない（#40・Codex）。
     def default_stopped?(id)
       @repository ||= ChatRepository.new
       return true if @repository.blocked(id)
       return true if @repository.opted_out(id)
-      return ChatGate.new(repository: @repository).penalized?(id)
+      gate = ChatGate.new(repository: @repository)
+      return gate.penalized?(id) || gate.over_quota?(id)
     end
 
     def setting(key)
