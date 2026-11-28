@@ -90,8 +90,8 @@ module Hadlar
     private
 
     # ⚠ **LLM を呼ぶ前に試行を数える**（落ちても費用はかかりうる・上限は試行で持つ）。
-    # 🔴 **同じ投稿に 2 度 LLM を呼ばない**（相手ごとの間隔が対象の古さより短い設定でも）。⚠ 覚えるのはプロセスの中だけ
-    # （再起動で忘れても、相手ごとの間隔と投稿の冪等キーが残る）。
+    # 🔴 **同じ投稿に 2 度 LLM を呼ばない**（相手ごとの間隔が対象の古さより短い設定でも）。⚠ `@seen` はプロセスの中の手前の歯止めで、
+    # 再起動をまたぐのは門の記録（`chat_event.status_id`・`TeaseGate#pick`）。
     def tease(status, now)
       @seen.push(status['id'].to_s)
       @seen.shift while @seen.size > SEEN_LIMIT

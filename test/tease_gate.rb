@@ -104,6 +104,14 @@ module Hadlar
       assert_equal('2', gate(0.0, 0).pick([status(2, 11)], now + TeaseGate::DAY + 1)['id'])
     end
 
+    # 🔴 **一度試した投稿は、相手ごとの間隔が過ぎても選ばない**（再起動でプロセスの記憶が消えても）。
+    def test_a_tried_status_is_never_picked_again
+      gate.record_try(status(1, 10), now - (2 * TeaseGate::DAY))
+
+      assert_nil(gate(0.0, 0).pick([status(1, 10)], now))
+      assert_equal('2', gate(0.0, 0).pick([status(1, 10), status(2, 10)], now)['id'])
+    end
+
     def test_records
       gate.record_try(status(1, 10), now)
       gate.record_post(status(1, 10), now)

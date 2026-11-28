@@ -261,6 +261,8 @@ chat:
       max_age: 15m
       min_length: 8
       max_length: 300
+      # 🔴 サーバーが毎回付ける既定のタグ（数えない・→ `TeaseCandidates`）。⚠ サーバーの名前なので、ここに書かず local.yaml に書く。
+      ignore_tags: []
   # 🔴 **悪戯の印の回数でペナルティを延ばす**（n 回目の印は n 番目。尽きたら最後のもの）。
   penalty:
     - 1d

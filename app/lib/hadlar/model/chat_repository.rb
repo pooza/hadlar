@@ -17,9 +17,15 @@ module Hadlar
       return @db[:chat_penalty]
     end
 
-    def record(account_id, acct, kind, at = Time.now)
+    # @param status_id [String, nil] 自分から絡んだ投稿（`tease_try` だけ・#40）
+    def record(account_id, acct, kind, at = Time.now, status_id: nil)
       return events.insert(account_id: account_id.to_s, acct: acct.to_s, kind: kind.to_s,
-        at: local(at))
+        at: local(at), status_id: status_id&.to_s)
+    end
+
+    # その投稿に `kind` を記録したことがあるか（#40）。
+    def recorded_status?(kind, status_id)
+      return events.where(kind: kind.to_s, status_id: status_id.to_s).any?
     end
 
     # `since` より後に、その相手へ `kind` を返した回数。⚠ `account_id` が nil なら全員。
