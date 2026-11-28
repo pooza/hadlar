@@ -87,14 +87,22 @@ module Hadlar
     end
 
     def text_reason(status)
-      # ⚠ **HTML でなく本文で見る** — タグ・メンションは href 付きのリンクになっている（数えないタグまで URL で落ちる）。
       text = ChatThread.text_of(status)
-      return :url if status['card'] || text.match?(URL_PATTERN)
+      return :url if status['card'] || text.match?(URL_PATTERN) || linked?(status)
       length = text.length
       return :short if length < setting('min_length')
       return :long if length > setting('max_length')
       return :stale if stale?(status)
       return nil
+    end
+
+    # 本文のリンク（⚠ 文字に URL が出ていないもの・「記事はこちら」の類いを含む）。
+    # ⚠ **タグ・メンションのリンクは数えない**（Mastodon が `class="mention"` 付きの href にする。数えないタグまで落ちる）。
+    def linked?(status)
+      return status['content'].to_s.scan(/<a\s[^>]*>/i).any? do |anchor|
+        next false if anchor.match?(/class="[^"]*\bmention\b[^"]*"/i)
+        anchor.match?(/href="#{URL_PATTERN.source}/i)
+      end
     end
 
     def account_reason(account)

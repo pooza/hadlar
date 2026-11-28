@@ -97,7 +97,11 @@ module Hadlar
         quote: [{quote: {'id' => '1'}}],
         mention: [{mentions: [{'id' => '11'}]}],
         tag: [{tags: [{'name' => 'jikkyo'}]}, {tags: [{'name' => 'default'}, {'name' => 'jikkyo'}]}],
-        url: [{card: {'url' => 'https://example.com'}}, {content: '<p>見てこれ https://example.com/a すごい</p>'}],
+        url: [
+          {card: {'url' => 'https://example.com'}},
+          {content: '<p>見てこれ https://example.com/a すごい</p>'},
+          {content: '<p>このニュースを見てほしい <a href="https://example.com/news">記事はこちら</a></p>'},
+        ],
       }.each do |reason, cases|
         cases.each {|fields| assert_equal(reason, @subject.reason(status(**fields)), fields.inspect)}
       end
