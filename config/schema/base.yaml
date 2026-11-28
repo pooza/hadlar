@@ -277,6 +277,73 @@ properties:
             type: string
         required:
           - max_age
+      # 自分から絡む（#25・→ `TeaseCandidates`）。
+      tease:
+        type: object
+        properties:
+          enabled:
+            type: boolean
+          draft:
+            type: boolean
+          interval:
+            type: string
+          chance:
+            type: number
+            minimum: 0
+            maximum: 1
+          limit:
+            type: object
+            properties:
+              try_per_day:
+                type: integer
+                minimum: 1
+              post_per_day:
+                type: integer
+                minimum: 1
+              post_interval:
+                type: string
+              account:
+                type: object
+                properties:
+                  try_interval:
+                    type: string
+                  post_interval:
+                    type: string
+                required:
+                  - try_interval
+                  - post_interval
+            required:
+              - try_per_day
+              - post_per_day
+              - post_interval
+              - account
+          candidate:
+            type: object
+            properties:
+              max_age:
+                type: string
+              min_length:
+                type: integer
+                minimum: 1
+              max_length:
+                type: integer
+                minimum: 1
+              ignore_tags:
+                type: array
+                items:
+                  type: string
+            required:
+              - max_age
+              - min_length
+              - max_length
+              - ignore_tags
+        required:
+          - enabled
+          - draft
+          - interval
+          - chance
+          - limit
+          - candidate
       # 返事を作る LLM（makoto2#18・→ `ChatModel`）。
       model:
         type: object

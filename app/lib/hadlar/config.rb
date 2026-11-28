@@ -21,6 +21,11 @@ module Hadlar
     DURATION_KEYS = [
       '/chat/grace/window',
       '/chat/catch_up/max_age',
+      '/chat/tease/candidate/max_age',
+      '/chat/tease/interval',
+      '/chat/tease/limit/post_interval',
+      '/chat/tease/limit/account/try_interval',
+      '/chat/tease/limit/account/post_interval',
       '/chat/model/timeout',
       '/chat/followers/refresh',
       '/streaming/stale',

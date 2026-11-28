@@ -157,6 +157,8 @@ module Hadlar
             # 🔴 **常駐自身の Sentry の状態**（makoto2#347・Codex の P1）。⚠⚠ **CLI が自分で初期化して言うと、
             # 設定を変えて再起動していない日に、常駐と違う状態を言う。**
             sentry: Hadlar.sentry_state.to_s,
+            # 🔴 **常駐自身の、自分から絡む形の状態**（#38・off / draft / on）。⚠ 理由は `sentry` と同じ。
+            tease: TeaseWorker.mode.to_s,
           )
         end
       end

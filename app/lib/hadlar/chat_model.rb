@@ -32,7 +32,7 @@ module Hadlar
     include Package
 
     # 悪戯の印（makoto2#510）。⚠ `config/chat/reply_format.md` の一覧と揃える。
-    MARKS = ['provoke', 'backstage', 'impersonate'].freeze
+    MARKS = ['provoke', 'backstage', 'impersonate', 'leave_alone'].freeze
 
     SCHEMA = {
       type: 'object',
@@ -45,6 +45,10 @@ module Hadlar
     }.freeze
 
     PROMPT_FILES = ['config/chat/persona.md', 'config/chat/reply_format.md'].freeze
+
+    # 🔴 **自分から絡む場面の指示書**（#37）。⚠⚠ **キャッシュの印より後ろに 3 つ目の塊として足す** — 前の 2 つ・モデル・effort・
+    # 出力の形を変えないので、返事とキャッシュを分け合える（変えると毎回書き込みの値になる・#25）。
+    TEASE_FILE = 'config/chat/tease.md'.freeze
 
     Reply = Data.define(:text, :marks, :usage) do
       # 「返事をしない」を選んだ（空の返事）。⚠ 失敗ではない。
@@ -75,8 +79,9 @@ module Hadlar
 
     # @param messages [Array<Hash>] `{role:, content:}` の並び。⚠ **最後は相手の投稿（`user`）**
     # @return [Reply, nil] ⚠ **失敗したら nil**（→ クラスの冒頭）
-    def respond(messages)
-      response = client.messages.create(**params(messages), request_options: request_options)
+    # @param scene [Hash, nil] 3 つ目の塊（→ `#tease`）
+    def respond(messages, scene: nil)
+      response = client.messages.create(**params(messages, scene:), request_options:)
       Heartbeat.clear_chat_failures if @record
       return parse(response)
     rescue Anthropic::Errors::AuthenticationError, Anthropic::Errors::PermissionDeniedError => e
@@ -95,11 +100,20 @@ module Hadlar
       return nil
     end
 
-    def params(messages)
+    # 見かけた投稿に、こちらから一言かけるか（#37）。⚠ **空の返事 ＝ 絡まない。**⚠ **失敗したら nil**（`#respond` と同じ）。
+    # 🔴 **印は捨てる** — 相手は話しかけていないので、独り言の中身でペナルティを付けない。
+    # @param text [String] 相手の投稿の平文
+    # @return [Reply, nil]
+    def tease(text)
+      reply = respond([{role: 'user', content: "〔フォロワーの投稿〕\n#{text}"}], scene: tease_block)
+      return reply&.with(marks: [])
+    end
+
+    def params(messages, scene: nil)
       return {
         model: setting('name'),
         max_tokens: setting('max_tokens'),
-        system_: system_blocks,
+        system_: scene ? [*system_blocks, scene] : system_blocks,
         output_config: {
           effort: setting('effort'),
           format: {type: :json_schema, schema: SCHEMA},
@@ -112,13 +126,16 @@ module Hadlar
     # 🔴 **最後の塊にキャッシュの印を付ける**（→ クラスの冒頭）。
     def system_blocks
       return @system_blocks if @system_blocks
-      blocks = PROMPT_FILES.map do |path|
-        text = File.read(File.join(Environment.dir, path))
-        {type: 'text', text: text.gsub(/<!--.*?-->\s*/m, '').strip}
-      end
+      blocks = PROMPT_FILES.map {|path| {type: 'text', text: prompt_text(path)}}
       blocks.last[:cache_control] = cache_control
       @system_blocks = blocks
       return @system_blocks
+    end
+
+    # ⚠ **起動時に一度だけ読む**（書き換えたら再起動）。⚠ **キャッシュの印を付けない**（→ `TEASE_FILE`）。
+    def tease_block
+      @tease_block ||= {type: 'text', text: prompt_text(TEASE_FILE)}
+      return @tease_block
     end
 
     # 使用量の見積もり（USD）。⚠ ログで見直すための目安で、請求額ではない。
@@ -134,6 +151,11 @@ module Hadlar
     end
 
     private
+
+    def prompt_text(path)
+      text = File.read(File.join(Environment.dir, path))
+      return text.gsub(/<!--.*?-->\s*/m, '').strip
+    end
 
     def cache_control
       ttl = setting('cache_ttl').to_s

@@ -17,9 +17,15 @@ module Hadlar
       return @db[:chat_penalty]
     end
 
-    def record(account_id, acct, kind, at = Time.now)
+    # @param status_id [String, nil] 自分から絡んだ投稿（`tease_try` だけ・#40）
+    def record(account_id, acct, kind, at = Time.now, status_id: nil)
       return events.insert(account_id: account_id.to_s, acct: acct.to_s, kind: kind.to_s,
-        at: local(at))
+        at: local(at), status_id: status_id&.to_s)
+    end
+
+    # その投稿に `kind` を記録したことがあるか（#40）。
+    def recorded_status?(kind, status_id)
+      return events.where(kind: kind.to_s, status_id: status_id.to_s).any?
     end
 
     # `since` より後に、その相手へ `kind` を返した回数。⚠ `account_id` が nil なら全員。
@@ -94,6 +100,35 @@ module Hadlar
 
     def all_blocks
       return blocks.reverse(:blocked_at).all
+    end
+
+    # 自分から絡まない相手（#39 → migration 005）。
+    def optouts
+      return @db[:tease_optout]
+    end
+
+    def opt_out(account_id, acct, at: Time.now)
+      key = account_id.to_s
+      return nil if opted_out(key)
+      return optouts.insert(account_id: key, acct: acct.to_s.delete_prefix('@'),
+        opted_out_at: local(at))
+    end
+
+    # 載っていれば行、無ければ nil。
+    def opted_out(account_id)
+      return optouts.where(account_id: account_id.to_s).first
+    end
+
+    def find_optout_by_acct(acct)
+      return optouts.where(acct: acct.to_s.delete_prefix('@')).first
+    end
+
+    def opt_in(account_id)
+      return optouts.where(account_id: account_id.to_s).delete
+    end
+
+    def all_optouts
+      return optouts.reverse(:opted_out_at).all
     end
 
     def find_penalty_by_acct(acct)

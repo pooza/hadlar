@@ -86,6 +86,19 @@ module Hadlar
       assert_equal([:silent, :global_limit], [decision.action, decision.reason])
     end
 
+    # 🔴 **返事の上限に達した相手には、自分から絡まない**（#40）— 「絡むな」が LLM に届かない。
+    def test_over_quota
+      assert_false(gate.over_quota?('1', now))
+      respond_times(config['/chat/limit/account/hour'])
+
+      assert_true(gate.over_quota?('1', now))
+      assert_false(gate.over_quota?('2', now))
+
+      config['/chat/limit/global/day'] = config['/chat/limit/account/hour']
+
+      assert_true(gate.over_quota?('2', now))
+    end
+
     # 🔴 **印の回数でペナルティを延ばす**（1 日 → 3 日 → 7 日・尽きたら最後のもの）。
     def test_penalty_grows_with_marks
       untils = Array.new(4) do |i|
