@@ -87,8 +87,10 @@ module Hadlar
     end
 
     def text_reason(status)
-      return :url if status['card'] || status['content'].to_s.match?(URL_PATTERN)
-      length = ChatThread.text_of(status).length
+      # ⚠ **HTML でなく本文で見る** — タグ・メンションは href 付きのリンクになっている（数えないタグまで URL で落ちる）。
+      text = ChatThread.text_of(status)
+      return :url if status['card'] || text.match?(URL_PATTERN)
+      length = text.length
       return :short if length < setting('min_length')
       return :long if length > setting('max_length')
       return :stale if stale?(status)

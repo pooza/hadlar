@@ -107,6 +107,9 @@ module Hadlar
     def test_default_tags_are_ignored
       assert_nil(@subject.reason(status(tags: [{'name' => 'default'}])))
       assert_nil(@subject.reason(status(tags: [{'name' => 'DEFAULT'}])))
+      linked = '<p>今日はいい天気だから散歩に行こうと思う<br><a href="https://example.com/tags/default" class="mention hashtag" rel="tag">#<span>default</span></a></p>'
+
+      assert_nil(@subject.reason(status(content: linked, tags: [{'name' => 'default'}])))
     end
 
     def test_length_and_age
